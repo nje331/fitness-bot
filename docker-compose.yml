@@ -1,0 +1,34 @@
+services:
+  fitness-bot:
+    build: .
+    container_name: fitness-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persistent database — survives container restarts and image rebuilds
+      - fitness-data:/data
+      # Persistent logs
+      - fitness-logs:/logs
+    command: python bot.py
+
+  fitness-bot-debug:
+    build: .
+    container_name: fitness-bot-debug
+    restart: "no"
+    env_file:
+      - .env
+    volumes:
+      - fitness-data-debug:/data
+      - fitness-logs:/logs
+    command: python bot.py --debug
+    profiles:
+      - debug
+
+volumes:
+  fitness-data:
+    driver: local
+  fitness-data-debug:
+    driver: local
+  fitness-logs:
+    driver: local
