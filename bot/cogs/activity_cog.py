@@ -44,12 +44,19 @@ class ActivityCog(commands.Cog):
         if message.channel.id != int(fitness_channel_id):
             return
 
-        # Must have at least one image attachment
-        has_image = any(
-            a.content_type and a.content_type.startswith("image/")
-            for a in message.attachments
-        )
-        if not has_image:
+        # Must have at least one image or video attachment (GIFs excluded)
+        def _is_valid(a: discord.Attachment) -> bool:
+            ct = a.content_type or ""
+            if ct.startswith("image/gif"):
+                return False
+            if ct.startswith("image/"):
+                return True
+            if ct.startswith("video/"):
+                return True
+            return False
+
+        has_valid = any(_is_valid(a) for a in message.attachments)
+        if not has_valid:
             return
 
         user = message.author

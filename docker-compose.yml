@@ -7,7 +7,7 @@ services:
       - .env
     volumes:
       # Persistent database — survives container restarts and image rebuilds
-      - fitness-data:/data
+      - ./data:/data
       # Persistent logs
       - fitness-logs:/logs
     command: python bot.py
