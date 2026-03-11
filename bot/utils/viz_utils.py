@@ -19,7 +19,6 @@ from datetime import date, timedelta
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
 import numpy as np
 
@@ -62,6 +61,7 @@ def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
     """
     7×1 grid heatmap for the given week.
     Each cell = one day, colored by proportion of active members.
+    No legend — color meaning is intuitive (green=low, yellow=med, orange=high, red=all).
     """
     week_end = week_start + timedelta(days=6)
 
@@ -84,12 +84,10 @@ def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
     today = today_local()
     today_idx = today.weekday() if week_start_for(today) == week_start else 7
 
-    title = (
-        f"Week of {week_start.strftime('%b %d')}–{week_end.strftime('%b %d, %Y')}"
-    )
+    title = f"Week of {week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
 
-    # Figure: wide and short — 7 cells in a row
-    fig, ax = plt.subplots(figsize=(9, 2.2))
+    # Compact figure — just the grid, no extra margins
+    fig, ax = plt.subplots(figsize=(7.5, 1.6))
     fig.patch.set_facecolor(COLOUR_BG)
     ax.set_facecolor(COLOUR_BG)
     ax.set_aspect("equal")
@@ -98,6 +96,7 @@ def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
     cell_w = 1.0
     cell_h = 1.0
     gap = 0.08
+    total_width = 7 * cell_w + 6 * gap
 
     for i in range(7):
         x = i * (cell_w + gap)
@@ -105,12 +104,11 @@ def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
 
         if i > today_idx:
             face_colour = COLOUR_FUTURE
-            label_colour = "#555577"
+            text_colour = "#555577"
         else:
             face_colour = _day_colour(day_counts[i], total_active)
-            label_colour = "#1e1e2e" if face_colour not in (COLOUR_ZERO, COLOUR_FUTURE) else "#777799"
+            text_colour = "#1e1e2e" if face_colour not in (COLOUR_ZERO, COLOUR_FUTURE) else "#888899"
 
-        # Draw cell
         rect = plt.Rectangle(
             (x, y), cell_w, cell_h,
             facecolor=face_colour,
@@ -120,62 +118,40 @@ def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
         )
         ax.add_patch(rect)
 
-        # Day label (e.g. "Mon")
+        # Day label
         ax.text(
-            x + cell_w / 2, y + cell_h * 0.72,
+            x + cell_w / 2, y + cell_h * 0.68,
             DAY_LABELS[i],
             ha="center", va="center",
-            color=label_colour if i <= today_idx else "#555577",
-            fontsize=11, fontweight="bold", zorder=3,
+            color=text_colour,
+            fontsize=10.5, fontweight="bold", zorder=3,
         )
 
-        # Count label (e.g. "4") — only if active
+        # Count (or dash for zero/future)
         if i <= today_idx:
             count_str = str(day_counts[i]) if day_counts[i] > 0 else "–"
             ax.text(
-                x + cell_w / 2, y + cell_h * 0.32,
+                x + cell_w / 2, y + cell_h * 0.30,
                 count_str,
                 ha="center", va="center",
-                color=label_colour,
-                fontsize=13, fontweight="bold", zorder=3,
+                color=text_colour,
+                fontsize=12, fontweight="bold", zorder=3,
             )
 
-    # Title
-    total_width = 7 * cell_w + 6 * gap
-    ax.set_xlim(-0.1, total_width + 0.1)
-    ax.set_ylim(-0.6, cell_h + 0.5)
+    ax.set_xlim(-0.05, total_width + 0.05)
+    ax.set_ylim(-0.15, cell_h + 0.35)
 
+    # Title above cells
     ax.text(
-        total_width / 2, cell_h + 0.35,
+        total_width / 2, cell_h + 0.22,
         title,
         ha="center", va="center",
-        color="white", fontsize=11, fontweight="bold",
+        color="white", fontsize=10, fontweight="bold",
     )
 
-    # Legend
-    legend_items = [
-        (COLOUR_LOW,    f"Low (1–{max(1, round(total_active * 0.32))})"),
-        (COLOUR_MEDIUM, f"Med ({max(1, round(total_active * 0.33))}–{max(1, round(total_active * 0.65))})"),
-        (COLOUR_HIGH,   f"High ({max(1, round(total_active * 0.66))}–{total_active - 1})"),
-        (COLOUR_MAX,    f"All {total_active}"),
-    ]
-    patches = [mpatches.Patch(color=c, label=l) for c, l in legend_items if total_active > 1 or c == COLOUR_MAX]
-    if total_active == 1:
-        patches = [mpatches.Patch(color=COLOUR_MAX, label="1 / 1 active")]
-
-    ax.legend(
-        handles=patches,
-        facecolor="#2d2d44", labelcolor="white",
-        edgecolor="#555", fontsize=7.5,
-        loc="lower center",
-        ncol=len(patches),
-        bbox_to_anchor=(0.5, -0.55),
-        framealpha=0.85,
-    )
-
-    plt.tight_layout(pad=0.3)
+    plt.tight_layout(pad=0.1)
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=140, bbox_inches="tight",
+    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     plt.close(fig)
     buf.seek(0)

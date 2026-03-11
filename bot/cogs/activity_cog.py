@@ -75,17 +75,15 @@ class ActivityCog(commands.Cog):
 
         if inserted:
             try:
-                # React with PogU (or fallback emoji)
-                # Try the custom emoji first; fall back to the literal string as unicode
                 try:
                     emoji_id = int(pog_emoji_str.split(":")[-1].rstrip(">"))
                     emoji = discord.utils.get(message.guild.emojis, id=emoji_id)
                     if emoji:
                         await message.add_reaction(emoji)
                     else:
-                        await message.add_reaction("💪")
+                        await message.add_reaction("🚶")
                 except (ValueError, IndexError):
-                    await message.add_reaction("💪")
+                    await message.add_reaction("🚶")
             except discord.HTTPException as e:
                 logger.warning("Failed to react to message: %s", e)
 
@@ -99,7 +97,10 @@ class ActivityCog(commands.Cog):
                     "Activity logged — user=%s date=%s", user.id, activity_date
                 )
         else:
-            logger.debug("Duplicate activity post ignored — user=%s date=%s", user.id, activity_date)
+            logger.debug(
+                "Duplicate activity post ignored — user=%s already has credit for %s (no reaction added)",
+                user.id, activity_date,
+            )
 
     # ── ✅ Reaction verification ───────────────────────────────────────────────
 

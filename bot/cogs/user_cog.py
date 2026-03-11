@@ -31,9 +31,11 @@ logger = logging.getLogger(__name__)
 # ─── /photos gallery ─────────────────────────────────────────────────────────
 
 class PhotosView(discord.ui.View):
-    def __init__(self, photos: list, page: int = 0):
+    def __init__(self, photos: list, bot: commands.Bot, guild_id: int, page: int = 0):
         super().__init__(timeout=120)
         self.photos = photos  # list of DB rows, most recent first
+        self.bot = bot
+        self.guild_id = guild_id
         self.page = page
         self._update_buttons()
 
@@ -41,7 +43,7 @@ class PhotosView(discord.ui.View):
         self.prev_btn.disabled = self.page == 0
         self.next_btn.disabled = self.page >= len(self.photos) - 1
 
-    def build_embed(self) -> discord.Embed:
+    async def build_embed(self) -> discord.Embed:
         if not self.photos:
             return base_embed("📸 Photos of the Week", "No photos selected yet!")
 
@@ -57,19 +59,36 @@ class PhotosView(discord.ui.View):
         embed.add_field(name="Reactions", value=str(photo["reaction_count"]), inline=True)
         embed.add_field(name="Week", value=week_label, inline=True)
         embed.set_footer(text=f"Week {self.page + 1} of {len(self.photos)}")
+
+        # Try to fetch the actual message to get the attachment image URL
+        channel_id = photo["channel_id"]
+        message_id = photo["message_id"]
+        if channel_id and message_id:
+            try:
+                ch = self.bot.get_channel(int(channel_id))
+                if ch:
+                    msg = await ch.fetch_message(int(message_id))
+                    if msg.attachments:
+                        embed.set_image(url=msg.attachments[0].url)
+                    jump_url = f"https://discord.com/channels/{self.guild_id}/{channel_id}/{message_id}"
+                    embed.add_field(name="📎 Original Post", value=f"[Jump to photo]({jump_url})", inline=False)
+            except (discord.NotFound, discord.HTTPException):
+                jump_url = f"https://discord.com/channels/{self.guild_id}/{channel_id}/{message_id}"
+                embed.add_field(name="📎 Original Post", value=f"[Jump to photo]({jump_url})", inline=False)
+
         return embed
 
     @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = max(0, self.page - 1)
         self._update_buttons()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
 
     @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = min(len(self.photos) - 1, self.page + 1)
         self._update_buttons()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
 
     @discord.ui.select(
         placeholder="Jump to week...",
@@ -80,7 +99,7 @@ class PhotosView(discord.ui.View):
     async def week_select(self, interaction: discord.Interaction, select: discord.ui.Select):
         self.page = int(select.values[0])
         self._update_buttons()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
 
     def populate_select(self):
         photos = self.photos
@@ -117,7 +136,7 @@ class UserCog(commands.Cog):
         )
 
         embed = discord.Embed(
-            title="💪 Fitness Challenge — Help",
+            title="🏃 Activity Challenge — Help",
             colour=COLOUR_PRIMARY,
         )
 
@@ -125,7 +144,7 @@ class UserCog(commands.Cog):
         embed.add_field(
             name="🏁 The Challenge",
             value=(
-                f"Stay active as many days as possible throughout the challenge!\n"
+                f"Get active as many days as possible throughout the challenge!\n"
                 f"• **Baseline goal:** {goal} days/week average\n"
                 f"• **Elite goal:** {elite} days/week average\n"
                 f"• Hit the goal by the end → you're invited to the **celebratory event** 🎉\n"
@@ -139,9 +158,9 @@ class UserCog(commands.Cog):
         embed.add_field(
             name="📸 How to Log Activity",
             value=(
-                f"Post **any workout photo** in {fitness_ch}.\n"
+                f"Post **any activity photo** in {fitness_ch} — a walk, a run, anything that gets you moving.\n"
                 f"• One photo per day counts — multiple posts won't give extra credit.\n"
-                f"• Any notable exercise counts (honor system).\n"
+                f"• Honor system: if you got out and moved, it counts.\n"
                 f"• {verify_note}"
             ),
             inline=False,
@@ -151,7 +170,7 @@ class UserCog(commands.Cog):
         embed.add_field(
             name="🏅 Photo of the Week",
             value=(
-                "Every Sunday night, the most-reacted workout photo is crowned **Photo of the Week**.\n"
+                "Every Monday morning, the most-reacted activity photo from the previous week is crowned **Photo of the Week**.\n"
                 "React to your favorites to help them win!"
             ),
             inline=False,
@@ -188,10 +207,11 @@ class UserCog(commands.Cog):
             embed.add_field(
                 name="🛠️ Debug Commands",
                 value=(
-                    "`/nextday` — Log activity for yourself for tomorrow\n"
+                    "`/nextday` — Advance bot's date by 1 day and log your activity\n"
+                    "`/resetday` — Reset bot date back to real today\n"
                     "`/endweek` — Trigger weekly announcement + DMs now\n"
                     "`/showsummary` — Post current week heatmap here\n"
-                    "`/triggersunday` — Trigger Sunday wrap-up now"
+                    "`/triggersunday` — Trigger full Monday wrap-up now"
                 ),
                 inline=False,
             )
@@ -266,10 +286,11 @@ class UserCog(commands.Cog):
             )
             return
 
-        view = PhotosView(photos, page=0)
+        await interaction.response.defer(ephemeral=True)
+        view = PhotosView(photos, bot=self.bot, guild_id=interaction.guild_id, page=0)
         view.populate_select()
-        embed = view.build_embed()
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        embed = await view.build_embed()
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 def build_updates_embed(enabled: bool) -> discord.Embed:
@@ -277,11 +298,11 @@ def build_updates_embed(enabled: bool) -> discord.Embed:
     embed = base_embed(
         "📬 DM Weekly Updates",
         f"Weekly summary DMs are currently: {status}\n\n"
-        "When enabled, you'll receive a personal DM every Sunday evening with:\n"
+        "When enabled, you'll receive a personal DM every Monday morning with:\n"
         "• Your activity count for the week\n"
         "• Your daily & weekly streaks\n"
         "• Your current tier and average\n"
-        "• A motivating message 💪",
+        "• A motivating message 🚶",
     )
     return embed
 

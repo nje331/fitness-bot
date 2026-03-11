@@ -1,27 +1,26 @@
 """
-scheduler_cog.py — APScheduler-based scheduled tasks.
+scheduler_cog.py — Scheduled tasks using discord.ext.tasks (no APScheduler dependency).
 
-Tasks:
-- Monday 9 AM ET: Group weekly announcement + streak update
-- Sunday 9 PM ET: Photo of the Week selection + DM summaries
-- Weekly heatmap post
+Monday 8 AM ET — all weekly actions fire together:
+  1. Heatmap + group summary embed posted to fitness channel
+  2. Photo of the Week selected and announced
+  3. Personal DM summaries sent to opted-in members
 """
 
 import logging
-from datetime import date, timedelta
+from datetime import date, timedelta, time as dtime
 from typing import Optional
+import asyncio
 
 import discord
-from discord.ext import commands
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+from discord.ext import commands, tasks
 import pytz
 
 from bot.database import (
-    get_setting, get_all_photos_of_week, set_photo_of_week,
-    update_group_streak, get_conn, get_active_members,
+    get_setting, set_photo_of_week,
+    update_group_streak, get_conn,
 )
-from bot.utils.time_utils import current_week_start, week_start_for, today_local, get_tz
+from bot.utils.time_utils import current_week_start, week_start_for, today_local
 from bot.utils.streak_utils import (
     compute_group_weekly_average, compute_daily_streak,
     compute_weekly_streak, compute_weekly_average, get_user_tier,
@@ -31,42 +30,45 @@ from bot.utils.embed_utils import base_embed, COLOUR_SUCCESS, COLOUR_ERROR, COLO
 
 logger = logging.getLogger(__name__)
 
+# Monday 8 AM Eastern
+_MONDAY_8AM_ET = dtime(hour=8, minute=0, tzinfo=pytz.timezone("US/Eastern"))
+
 
 class SchedulerCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.scheduler = AsyncIOScheduler(timezone="US/Eastern")
-        self._register_jobs()
-        self.scheduler.start()
-        logger.info("Scheduler started.")
-
-    def _register_jobs(self):
-        # Monday 9 AM ET — group weekly summary
-        self.scheduler.add_job(
-            self.weekly_group_announcement,
-            CronTrigger(day_of_week="mon", hour=9, minute=0, timezone="US/Eastern"),
-            id="weekly_group",
-            replace_existing=True,
-        )
-        # Sunday 9 PM ET — photo of the week + DM summaries
-        self.scheduler.add_job(
-            self.sunday_wrap_up,
-            CronTrigger(day_of_week="sun", hour=21, minute=0, timezone="US/Eastern"),
-            id="sunday_wrap",
-            replace_existing=True,
-        )
+        self.monday_tasks.start()
+        logger.info("Scheduler started (discord.ext.tasks).")
 
     def cog_unload(self):
-        self.scheduler.shutdown(wait=False)
+        self.monday_tasks.cancel()
+
+    # ── Loop: fires once per day, acts only on Monday ─────────────────────────
+
+    @tasks.loop(time=_MONDAY_8AM_ET)
+    async def monday_tasks(self):
+        today = today_local()
+        if today.weekday() != 0:   # 0 = Monday
+            return
+        logger.info("Monday 8 AM task firing.")
+        # Previous week = the Mon–Sun that just ended
+        prev_monday = today - timedelta(days=7)
+        week_start = week_start_for(prev_monday)
+        await self._run_weekly(week_start)
+
+    @monday_tasks.before_loop
+    async def before_monday_tasks(self):
+        await self.bot.wait_until_ready()
+
+    # ── Orchestrator ──────────────────────────────────────────────────────────
+
+    async def _run_weekly(self, week_start: date):
+        """Run all weekly actions for the given week_start (Mon date)."""
+        await self._post_heatmap_and_summary(week_start)
+        await self._select_photo_of_week(week_start)
+        await self._send_dm_summaries(week_start)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
-
-    async def _get_admin_channel(self) -> Optional[discord.TextChannel]:
-        cid = get_setting("admin_channel_id")
-        if not cid:
-            return None
-        ch = self.bot.get_channel(int(cid))
-        return ch if isinstance(ch, discord.TextChannel) else None
 
     async def _get_fitness_channel(self) -> Optional[discord.TextChannel]:
         cid = get_setting("fitness_channel_id")
@@ -75,41 +77,61 @@ class SchedulerCog(commands.Cog):
         ch = self.bot.get_channel(int(cid))
         return ch if isinstance(ch, discord.TextChannel) else None
 
-    # ── Sunday 9 PM — Heatmap + Photo of the Week + DM summaries ────────────
+    # ── 1. Heatmap + group summary ────────────────────────────────────────────
 
-    async def sunday_wrap_up(self):
-        logger.info("Running sunday_wrap_up task")
-        today = today_local()
-        week_start = week_start_for(today)
-
-        # Post heatmap first, then photo, then DMs
-        await self._post_heatmap(week_start)
-        await self._select_photo_of_week(week_start)
-        await self._send_dm_summaries(week_start)
-
-    async def _post_heatmap(self, week_start: date):
-        """Post the weekly heatmap to the fitness channel."""
+    async def _post_heatmap_and_summary(self, week_start: date):
         fitness_ch = await self._get_fitness_channel()
         if not fitness_ch:
             logger.warning("No fitness channel set; skipping heatmap.")
             return
+
+        week_end = week_start + timedelta(days=6)
+        week_label = f"{week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
+
+        avg, member_count = compute_group_weekly_average(week_start)
+        goal = float(get_setting("goal_days_per_week") or 4)
+        success = avg >= goal
+        current_streak, best_streak = update_group_streak(success, week_start)
+
+        colour = COLOUR_SUCCESS if success else COLOUR_ERROR
+
+        if success:
+            summary_line = f"✅ Group hit the goal! Streak: **{current_streak}** week(s) 🔥"
+        else:
+            summary_line = f"📉 Goal not met (avg {avg} < {goal}). Streak reset — let's bounce back!"
+
+        description = (
+            f"{summary_line}\n\n"
+            f"**Group avg:** {avg} days/member  •  "
+            f"**Goal:** {goal} days/wk  •  "
+            f"**Members:** {member_count}"
+        )
+        if best_streak > 1:
+            description += f"\n**Best streak:** {best_streak} weeks"
+
+        embed = discord.Embed(
+            title=f"📊 Weekly Summary — {week_label}",
+            description=description,
+            colour=colour,
+        )
+        embed.set_footer(text="💪 Activity Challenge Bot")
+
         try:
             buf = generate_weekly_heatmap(week_start)
             file = discord.File(buf, filename="heatmap.png")
-            embed = base_embed(
-                f"📊 Week of {week_start.strftime('%b %d, %Y')} — Activity Heatmap",
-                f"{week_start.strftime('%b %d')} – {(week_start + timedelta(days=6)).strftime('%b %d, %Y')}",
-            )
             embed.set_image(url="attachment://heatmap.png")
             await fitness_ch.send(embed=embed, file=file)
-            logger.info("Heatmap posted for week %s", week_start)
         except Exception as e:
             logger.warning("Heatmap generation failed: %s", e)
+            await fitness_ch.send(embed=embed)
+
+        logger.info("Weekly summary posted. avg=%.2f success=%s streak=%d", avg, success, current_streak)
+
+    # ── 2. Photo of the Week ──────────────────────────────────────────────────
 
     async def _select_photo_of_week(self, week_start: date):
         fitness_ch = await self._get_fitness_channel()
         if not fitness_ch:
-            logger.warning("No fitness channel set; skipping photo of the week.")
             return
 
         week_end = week_start + timedelta(days=6)
@@ -121,7 +143,7 @@ class SchedulerCog(commands.Cog):
             ).fetchall()
 
         if not rows:
-            logger.info("No verified activities this week; no Photo of the Week.")
+            logger.info("No verified activities this week; skipping Photo of the Week.")
             return
 
         best_msg_id = None
@@ -138,7 +160,6 @@ class SchedulerCog(commands.Cog):
                     continue
                 msg = await ch.fetch_message(row["message_id"])
                 reaction_count = sum(r.count for r in msg.reactions)
-                # Earliest post wins ties
                 if reaction_count > best_reactions:
                     best_reactions = reaction_count
                     best_msg_id = row["message_id"]
@@ -152,7 +173,6 @@ class SchedulerCog(commands.Cog):
 
         set_photo_of_week(week_start, best_user_id, best_msg_id, best_channel_id, best_reactions)
 
-        # Announce in fitness channel
         guild = fitness_ch.guild
         winner = guild.get_member(best_user_id)
         winner_name = winner.display_name if winner else f"User {best_user_id}"
@@ -162,11 +182,12 @@ class SchedulerCog(commands.Cog):
         except discord.NotFound:
             winning_msg = None
 
+        week_label = f"{week_start.strftime('%b %d')} – {(week_start + timedelta(days=6)).strftime('%b %d, %Y')}"
         embed = discord.Embed(
             title="📸 Photo of the Week!",
             description=(
-                f"🏅 Congratulations to **{winner_name}** for this week's most-reacted workout photo!\n\n"
-                f"**Week of:** {week_start.strftime('%b %d')} – {(week_start + timedelta(days=6)).strftime('%b %d, %Y')}\n"
+                f"🏅 Congratulations to **{winner_name}** for this week's most-reacted photo!\n\n"
+                f"**Week of:** {week_label}\n"
                 f"**Reactions:** {best_reactions}"
             ),
             colour=COLOUR_ELITE,
@@ -178,6 +199,8 @@ class SchedulerCog(commands.Cog):
 
         await fitness_ch.send(embed=embed)
         logger.info("Photo of the Week announced: user=%s message=%s", best_user_id, best_msg_id)
+
+    # ── 3. DM summaries ───────────────────────────────────────────────────────
 
     async def _send_dm_summaries(self, week_start: date):
         with get_conn() as conn:
@@ -209,18 +232,17 @@ class SchedulerCog(commands.Cog):
         hit_goal = this_week_count >= goal
         colour = COLOUR_SUCCESS if hit_goal else COLOUR_ERROR
 
-        # Motivating message (no comparisons to others/group)
         if this_week_count == 0:
-            message = "Every journey starts with a single step. Next week is a fresh slate — you've got this! 💪"
+            message = "Every step counts — next week is a fresh start. You've got this! 🚶"
         elif not hit_goal:
             message = f"You logged **{this_week_count}** day(s) this week. Keep building that momentum — consistency is everything!"
         elif tier == "Elite":
-            message = f"🔥 **Elite week!** You crushed it with {this_week_count} active days. Incredible consistency!"
+            message = f"🔥 **Elite week!** You stayed active {this_week_count} days. Incredible consistency!"
         else:
-            message = f"✅ **Goal hit!** {this_week_count} active days this week — you're right on track. Keep it rolling!"
+            message = f"✅ **Goal hit!** {this_week_count} active days this week — right on track. Keep it rolling!"
 
         embed = discord.Embed(
-            title=f"📊 Your Weekly Summary",
+            title="📊 Your Weekly Summary",
             description=message,
             colour=colour,
         )
@@ -242,72 +264,47 @@ class SchedulerCog(commands.Cog):
         await user.send(embed=embed)
         logger.info("DM summary sent to user %s", user_id)
 
-    # ── Monday 9 AM — Group weekly announcement ───────────────────────────────
+    # ── Public trigger methods (used by debug cog) ────────────────────────────
 
-    async def weekly_group_announcement(self, use_current_week: bool = False):
-        logger.info("Running weekly_group_announcement task (use_current_week=%s)", use_current_week)
-        fitness_ch = await self._get_fitness_channel()
-        if not fitness_ch:
-            logger.warning("No fitness channel set; skipping weekly announcement.")
-            return
-
+    async def trigger_end_week(self, use_current_week: bool = False):
         today = today_local()
         if use_current_week:
             week_start = week_start_for(today)
         else:
-            prev_monday = today - timedelta(days=7)
-            week_start = week_start_for(prev_monday)
+            week_start = week_start_for(today - timedelta(days=7))
+        await self._run_weekly(week_start)
+
+    async def trigger_sunday(self):
+        """Debug alias — runs the full weekly suite for current week."""
+        week_start = week_start_for(today_local())
+        await self._run_weekly(week_start)
+
+    async def trigger_show_summary(self, channel: discord.TextChannel):
+        """Post current week's heatmap + summary to a given channel."""
+        week_start = current_week_start()
+        week_end = week_start + timedelta(days=6)
+        week_label = f"{week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
 
         avg, member_count = compute_group_weekly_average(week_start)
         goal = float(get_setting("goal_days_per_week") or 4)
         success = avg >= goal
 
-        current_streak, best_streak = update_group_streak(success, week_start)
+        description = (
+            f"**Group avg:** {avg} days/member  •  "
+            f"**Goal:** {goal} days/wk  •  "
+            f"**Members:** {member_count}"
+        )
 
         embed = discord.Embed(
-            title="📅 Weekly Group Update",
+            title=f"📊 Current Week — {week_label}",
+            description=description,
             colour=COLOUR_SUCCESS if success else COLOUR_ERROR,
         )
-        week_label = f"{week_start.strftime('%b %d')} – {(week_start + timedelta(days=6)).strftime('%b %d, %Y')}"
-        embed.add_field(name="Week", value=week_label, inline=False)
-        embed.add_field(name="Group Average", value=f"**{avg}** days / member", inline=True)
-        embed.add_field(name="Active Members", value=str(member_count), inline=True)
-        embed.add_field(name="Goal", value=f"{goal} days/wk", inline=True)
+        embed.set_footer(text="💪 Activity Challenge Bot")
 
-        if success:
-            embed.description = f"✅ The group hit the goal! Group streak: **{current_streak}** week(s) 🔥"
-        else:
-            embed.description = f"📉 Goal not met this week (avg {avg} < {goal}). Group streak reset. Let's bounce back!"
-
-        if best_streak > 1:
-            embed.add_field(name="Best Group Streak", value=f"**{best_streak}** weeks", inline=False)
-
-        await fitness_ch.send(embed=embed)
-        logger.info("Weekly group announcement sent. avg=%.2f success=%s", avg, success)
-
-    # ── Public trigger methods (used by debug cog) ────────────────────────────
-
-    async def trigger_end_week(self, use_current_week: bool = False):
-        """
-        Trigger the weekly announcement.
-        use_current_week=True uses the current week (for debug/testing).
-        use_current_week=False (default/prod) uses the previous week.
-        """
-        await self.weekly_group_announcement(use_current_week=use_current_week)
-
-    async def trigger_sunday(self):
-        await self.sunday_wrap_up()
-
-    async def trigger_show_summary(self, channel: discord.TextChannel):
-        """Post current week's heatmap to a given channel."""
-        week_start = current_week_start()
         try:
             buf = generate_weekly_heatmap(week_start)
             file = discord.File(buf, filename="heatmap.png")
-            embed = base_embed(
-                f"📊 Current Week Heatmap",
-                f"Week of {week_start.strftime('%b %d, %Y')}",
-            )
             embed.set_image(url="attachment://heatmap.png")
             await channel.send(embed=embed, file=file)
         except Exception as e:
