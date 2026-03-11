@@ -1,5 +1,9 @@
 """
 time_utils.py — Timezone-aware date/time helpers.
+
+In debug mode, the bot may set `bot.debug_date_offset` (int, days) on the bot
+instance. today_local() and now_local() respect that offset so all downstream
+logic (streak calc, weekly counts, heatmap, etc.) sees the simulated date.
 """
 
 from datetime import date, datetime, timedelta
@@ -15,8 +19,22 @@ def get_tz() -> pytz.BaseTzInfo:
         return pytz.timezone("US/Eastern")
 
 
+def _debug_offset() -> int:
+    """Return the current debug date offset (days) from the bot instance, or 0."""
+    try:
+        # Import here to avoid circular imports; only resolves if bot is running
+        import bot as bot_module
+        # The running bot instance stores itself on the module at startup (see bot.py)
+        instance = getattr(bot_module, "_bot_instance", None)
+        if instance is not None:
+            return getattr(instance, "debug_date_offset", 0)
+    except Exception:
+        pass
+    return 0
+
+
 def now_local() -> datetime:
-    return datetime.now(tz=get_tz())
+    return datetime.now(tz=get_tz()) + timedelta(days=_debug_offset())
 
 
 def today_local() -> date:

@@ -75,16 +75,36 @@ class SchedulerCog(commands.Cog):
         ch = self.bot.get_channel(int(cid))
         return ch if isinstance(ch, discord.TextChannel) else None
 
-    # ── Sunday 9 PM — Photo of the Week + DM summaries ───────────────────────
+    # ── Sunday 9 PM — Heatmap + Photo of the Week + DM summaries ────────────
 
     async def sunday_wrap_up(self):
         logger.info("Running sunday_wrap_up task")
-        last_monday = today_local() - timedelta(days=today_local().weekday())
-        # The week that just ended is last_monday's week
-        week_start = last_monday
+        today = today_local()
+        week_start = week_start_for(today)
 
+        # Post heatmap first, then photo, then DMs
+        await self._post_heatmap(week_start)
         await self._select_photo_of_week(week_start)
         await self._send_dm_summaries(week_start)
+
+    async def _post_heatmap(self, week_start: date):
+        """Post the weekly heatmap to the fitness channel."""
+        fitness_ch = await self._get_fitness_channel()
+        if not fitness_ch:
+            logger.warning("No fitness channel set; skipping heatmap.")
+            return
+        try:
+            buf = generate_weekly_heatmap(week_start)
+            file = discord.File(buf, filename="heatmap.png")
+            embed = base_embed(
+                f"📊 Week of {week_start.strftime('%b %d, %Y')} — Activity Heatmap",
+                f"{week_start.strftime('%b %d')} – {(week_start + timedelta(days=6)).strftime('%b %d, %Y')}",
+            )
+            embed.set_image(url="attachment://heatmap.png")
+            await fitness_ch.send(embed=embed, file=file)
+            logger.info("Heatmap posted for week %s", week_start)
+        except Exception as e:
+            logger.warning("Heatmap generation failed: %s", e)
 
     async def _select_photo_of_week(self, week_start: date):
         fitness_ch = await self._get_fitness_channel()
@@ -262,20 +282,8 @@ class SchedulerCog(commands.Cog):
         if best_streak > 1:
             embed.add_field(name="Best Group Streak", value=f"**{best_streak}** weeks", inline=False)
 
-        # Attach heatmap
-        try:
-            buf = generate_weekly_heatmap(week_start)
-            file = discord.File(buf, filename="heatmap.png")
-            embed.set_image(url="attachment://heatmap.png")
-            await fitness_ch.send(embed=embed, file=file)
-        except Exception as e:
-            logger.warning("Heatmap generation failed: %s", e)
-            await fitness_ch.send(embed=embed)
-
+        await fitness_ch.send(embed=embed)
         logger.info("Weekly group announcement sent. avg=%.2f success=%s", avg, success)
-
-        # Send DM summaries for this same week
-        await self._send_dm_summaries(week_start)
 
     # ── Public trigger methods (used by debug cog) ────────────────────────────
 
@@ -288,10 +296,7 @@ class SchedulerCog(commands.Cog):
         await self.weekly_group_announcement(use_current_week=use_current_week)
 
     async def trigger_sunday(self):
-        today = today_local()
-        week_start = week_start_for(today)
-        await self._select_photo_of_week(week_start)
-        await self._send_dm_summaries(week_start)
+        await self.sunday_wrap_up()
 
     async def trigger_show_summary(self, channel: discord.TextChannel):
         """Post current week's heatmap to a given channel."""

@@ -1,8 +1,15 @@
 """
 viz_utils.py — Matplotlib visualizations.
 
-generate_weekly_heatmap: group-level bar chart showing how many members
-were active each day of the week, not a per-person grid.
+generate_weekly_heatmap: 7×1 colored grid showing how many members
+were active each day of the week. Color scale:
+  - No members active → dim grey (future or zero)
+  - Low activity      → green
+  - Medium activity   → yellow
+  - High activity     → orange
+  - All members active → red
+
+The thresholds scale with total active member count.
 """
 
 import io
@@ -13,24 +20,51 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.colors as mcolors
 import numpy as np
 
 from bot.database import get_conn
-from bot.utils.time_utils import week_start_for, challenge_dates, today_local
+from bot.utils.time_utils import week_start_for, today_local
 
 logger = logging.getLogger(__name__)
 
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
+# Colors for the grid cells
+COLOUR_FUTURE  = "#2a2a3e"   # muted — not yet happened
+COLOUR_ZERO    = "#3a3a4e"   # dark grey — nobody active
+COLOUR_LOW     = "#57F287"   # green
+COLOUR_MEDIUM  = "#FEE75C"   # yellow
+COLOUR_HIGH    = "#F0A030"   # orange
+COLOUR_MAX     = "#ED4245"   # red — 100% of members active
+COLOUR_BG      = "#1e1e2e"
+
+
+def _day_colour(count: int, total: int) -> str:
+    """
+    Map (count, total) to a grid cell color.
+    Scale: 0=grey, 0<x<33%=green, 33-66%=yellow, 66-99%=orange, 100%=red.
+    """
+    if total == 0 or count == 0:
+        return COLOUR_ZERO
+    ratio = count / total
+    if ratio >= 1.0:
+        return COLOUR_MAX
+    elif ratio >= 0.66:
+        return COLOUR_HIGH
+    elif ratio >= 0.33:
+        return COLOUR_MEDIUM
+    else:
+        return COLOUR_LOW
+
 
 def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
     """
-    Group-level activity chart for the given week.
-    Each bar = number of members active that day.
+    7×1 grid heatmap for the given week.
+    Each cell = one day, colored by proportion of active members.
     """
     week_end = week_start + timedelta(days=6)
 
-    # Count how many members logged activity on each day of the week
     with get_conn() as conn:
         total_active = conn.execute(
             "SELECT COUNT(DISTINCT user_id) FROM members WHERE is_active=1"
@@ -47,82 +81,101 @@ def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
             d = date.fromisoformat(r["activity_date"])
             day_counts[d.weekday()] += 1
 
-    # Today's weekday index — grey out future days
     today = today_local()
     today_idx = today.weekday() if week_start_for(today) == week_start else 7
 
     title = (
-        f"Group Activity — Week of "
-        f"{week_start.strftime('%b %d')}–{week_end.strftime('%b %d, %Y')}"
+        f"Week of {week_start.strftime('%b %d')}–{week_end.strftime('%b %d, %Y')}"
     )
 
-    fig, ax = plt.subplots(figsize=(9, 4))
-    fig.patch.set_facecolor("#1e1e2e")
-    ax.set_facecolor("#1e1e2e")
+    # Figure: wide and short — 7 cells in a row
+    fig, ax = plt.subplots(figsize=(9, 2.2))
+    fig.patch.set_facecolor(COLOUR_BG)
+    ax.set_facecolor(COLOUR_BG)
+    ax.set_aspect("equal")
+    ax.axis("off")
 
-    colours = []
+    cell_w = 1.0
+    cell_h = 1.0
+    gap = 0.08
+
     for i in range(7):
+        x = i * (cell_w + gap)
+        y = 0
+
         if i > today_idx:
-            colours.append("#3a3a55")  # future — muted
-        elif day_counts[i] == 0:
-            colours.append("#44445a")  # zero — dim
-        elif day_counts[i] >= total_active:
-            colours.append("#57F287")  # full house — green
+            face_colour = COLOUR_FUTURE
+            label_colour = "#555577"
         else:
-            colours.append("#5865F2")  # partial — blurple
+            face_colour = _day_colour(day_counts[i], total_active)
+            label_colour = "#1e1e2e" if face_colour not in (COLOUR_ZERO, COLOUR_FUTURE) else "#777799"
 
-    bars = ax.bar(range(7), day_counts, color=colours, width=0.6, zorder=3)
+        # Draw cell
+        rect = plt.Rectangle(
+            (x, y), cell_w, cell_h,
+            facecolor=face_colour,
+            edgecolor="#11111e",
+            linewidth=1.5,
+            zorder=2,
+        )
+        ax.add_patch(rect)
 
-    # Label each bar with count
-    for i, (bar, count) in enumerate(zip(bars, day_counts)):
-        if i <= today_idx and count > 0:
+        # Day label (e.g. "Mon")
+        ax.text(
+            x + cell_w / 2, y + cell_h * 0.72,
+            DAY_LABELS[i],
+            ha="center", va="center",
+            color=label_colour if i <= today_idx else "#555577",
+            fontsize=11, fontweight="bold", zorder=3,
+        )
+
+        # Count label (e.g. "4") — only if active
+        if i <= today_idx:
+            count_str = str(day_counts[i]) if day_counts[i] > 0 else "–"
             ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.05,
-                str(count),
-                ha="center", va="bottom", color="white", fontsize=11, fontweight="bold",
+                x + cell_w / 2, y + cell_h * 0.32,
+                count_str,
+                ha="center", va="center",
+                color=label_colour,
+                fontsize=13, fontweight="bold", zorder=3,
             )
 
-    ax.set_xticks(range(7))
-    ax.set_xticklabels(DAY_LABELS, color="white", fontsize=12)
-    ax.set_ylabel("Members Active", color="white", fontsize=10)
-    ax.tick_params(colors="white", length=0)
-    ax.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
-    ax.set_ylim(0, max(total_active + 0.5, max(day_counts) + 1))
-    ax.set_title(title, color="white", fontsize=13, pad=12)
-    ax.grid(axis="y", color="#333355", linewidth=0.7, zorder=0)
+    # Title
+    total_width = 7 * cell_w + 6 * gap
+    ax.set_xlim(-0.1, total_width + 0.1)
+    ax.set_ylim(-0.6, cell_h + 0.5)
 
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-
-    # Goal line
-    try:
-        from bot.database import get_setting
-        goal = float(get_setting("goal_days_per_week") or 4)
-    except Exception:
-        goal = 4.0
-
-    ax.axhline(y=total_active, color="#57F287", linestyle="--", linewidth=1,
-               alpha=0.5, label=f"All {total_active} members")
-
-    # Legend patches
-    legend_patches = [
-        mpatches.Patch(color="#57F287", label=f"All {total_active} active"),
-        mpatches.Patch(color="#5865F2", label="Partial"),
-        mpatches.Patch(color="#44445a", label="Zero"),
-    ]
-    if today_idx < 6:
-        legend_patches.append(mpatches.Patch(color="#3a3a55", label="Upcoming"))
-    ax.legend(
-        handles=legend_patches,
-        facecolor="#2d2d44", labelcolor="white",
-        edgecolor="#555", fontsize=8,
-        loc="upper right",
+    ax.text(
+        total_width / 2, cell_h + 0.35,
+        title,
+        ha="center", va="center",
+        color="white", fontsize=11, fontweight="bold",
     )
 
-    plt.tight_layout()
+    # Legend
+    legend_items = [
+        (COLOUR_LOW,    f"Low (1–{max(1, round(total_active * 0.32))})"),
+        (COLOUR_MEDIUM, f"Med ({max(1, round(total_active * 0.33))}–{max(1, round(total_active * 0.65))})"),
+        (COLOUR_HIGH,   f"High ({max(1, round(total_active * 0.66))}–{total_active - 1})"),
+        (COLOUR_MAX,    f"All {total_active}"),
+    ]
+    patches = [mpatches.Patch(color=c, label=l) for c, l in legend_items if total_active > 1 or c == COLOUR_MAX]
+    if total_active == 1:
+        patches = [mpatches.Patch(color=COLOUR_MAX, label="1 / 1 active")]
+
+    ax.legend(
+        handles=patches,
+        facecolor="#2d2d44", labelcolor="white",
+        edgecolor="#555", fontsize=7.5,
+        loc="lower center",
+        ncol=len(patches),
+        bbox_to_anchor=(0.5, -0.55),
+        framealpha=0.85,
+    )
+
+    plt.tight_layout(pad=0.3)
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight",
+    plt.savefig(buf, format="png", dpi=140, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     plt.close(fig)
     buf.seek(0)
@@ -145,8 +198,8 @@ def generate_group_trend_chart(since: date) -> io.BytesIO:
         goal = 4.0
 
     fig, ax = plt.subplots(figsize=(10, 4))
-    fig.patch.set_facecolor("#1e1e2e")
-    ax.set_facecolor("#1e1e2e")
+    fig.patch.set_facecolor(COLOUR_BG)
+    ax.set_facecolor(COLOUR_BG)
 
     ax.plot(labels, averages, color="#5865F2", linewidth=2.5, marker="o",
             markersize=6, label="Group Avg")

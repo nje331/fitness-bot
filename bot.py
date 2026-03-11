@@ -71,6 +71,7 @@ class FitnessBot(commands.Bot):
             help_command=None,
         )
         self.debug_mode = DEBUG
+        self.debug_date_offset: int = 0  # days ahead of real today (debug only)
 
     async def setup_hook(self):
         # Load all cogs
@@ -139,6 +140,11 @@ def main():
         sys.exit(1)
 
     bot = FitnessBot()
+
+    # Register on the module so time_utils._debug_offset() can reach it
+    import bot as bot_module
+    bot_module._bot_instance = bot
+
     bot.run(token, log_handler=None)
 
 
