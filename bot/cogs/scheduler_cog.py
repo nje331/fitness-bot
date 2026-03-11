@@ -224,17 +224,19 @@ class SchedulerCog(commands.Cog):
 
     # ── Monday 9 AM — Group weekly announcement ───────────────────────────────
 
-    async def weekly_group_announcement(self):
-        logger.info("Running weekly_group_announcement task")
+    async def weekly_group_announcement(self, use_current_week: bool = False):
+        logger.info("Running weekly_group_announcement task (use_current_week=%s)", use_current_week)
         fitness_ch = await self._get_fitness_channel()
         if not fitness_ch:
             logger.warning("No fitness channel set; skipping weekly announcement.")
             return
 
-        # The week that just ended is Mon–Sun prior to today
         today = today_local()
-        prev_monday = today - timedelta(days=7)
-        week_start = week_start_for(prev_monday)
+        if use_current_week:
+            week_start = week_start_for(today)
+        else:
+            prev_monday = today - timedelta(days=7)
+            week_start = week_start_for(prev_monday)
 
         avg, member_count = compute_group_weekly_average(week_start)
         goal = float(get_setting("goal_days_per_week") or 4)
@@ -272,10 +274,18 @@ class SchedulerCog(commands.Cog):
 
         logger.info("Weekly group announcement sent. avg=%.2f success=%s", avg, success)
 
+        # Send DM summaries for this same week
+        await self._send_dm_summaries(week_start)
+
     # ── Public trigger methods (used by debug cog) ────────────────────────────
 
-    async def trigger_end_week(self):
-        await self.weekly_group_announcement()
+    async def trigger_end_week(self, use_current_week: bool = False):
+        """
+        Trigger the weekly announcement.
+        use_current_week=True uses the current week (for debug/testing).
+        use_current_week=False (default/prod) uses the previous week.
+        """
+        await self.weekly_group_announcement(use_current_week=use_current_week)
 
     async def trigger_sunday(self):
         today = today_local()

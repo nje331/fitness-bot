@@ -1,11 +1,13 @@
 """
-viz_utils.py — Matplotlib/Pillow visualizations for weekly heatmaps.
+viz_utils.py — Matplotlib visualizations.
+
+generate_weekly_heatmap: group-level bar chart showing how many members
+were active each day of the week, not a per-person grid.
 """
 
 import io
 import logging
 from datetime import date, timedelta
-from typing import Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -13,7 +15,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
 
-from bot.database import get_conn, get_active_members
+from bot.database import get_conn
 from bot.utils.time_utils import week_start_for, challenge_dates, today_local
 
 logger = logging.getLogger(__name__)
@@ -21,80 +23,102 @@ logger = logging.getLogger(__name__)
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
-def _get_week_activity_matrix(week_start: date) -> tuple[np.ndarray, list[str]]:
+def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
     """
-    Returns (matrix, member_names) where matrix[member][day] = 0 or 1.
+    Group-level activity chart for the given week.
+    Each bar = number of members active that day.
     """
-    from datetime import timedelta
     week_end = week_start + timedelta(days=6)
 
+    # Count how many members logged activity on each day of the week
     with get_conn() as conn:
-        members = conn.execute(
-            "SELECT user_id, username FROM members WHERE is_active=1 ORDER BY username"
+        total_active = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM members WHERE is_active=1"
+        ).fetchone()[0] or 1
+
+        day_counts = [0] * 7
+        rows = conn.execute(
+            "SELECT activity_date FROM activity_logs "
+            "WHERE activity_date BETWEEN ? AND ? AND verified>0",
+            (week_start.isoformat(), week_end.isoformat()),
         ).fetchall()
 
-        matrix = []
-        names = []
-        for m in members:
-            row = [0] * 7
-            logs = conn.execute(
-                "SELECT activity_date FROM activity_logs "
-                "WHERE user_id=? AND activity_date BETWEEN ? AND ? AND verified>0",
-                (m["user_id"], week_start.isoformat(), week_end.isoformat()),
-            ).fetchall()
-            for log in logs:
-                d = date.fromisoformat(log["activity_date"])
-                day_idx = d.weekday()  # 0=Mon
-                row[day_idx] = 1
-            matrix.append(row)
-            names.append(m["username"])
+        for r in rows:
+            d = date.fromisoformat(r["activity_date"])
+            day_counts[d.weekday()] += 1
 
-    return np.array(matrix, dtype=float) if matrix else np.zeros((1, 7)), names
+    # Today's weekday index — grey out future days
+    today = today_local()
+    today_idx = today.weekday() if week_start_for(today) == week_start else 7
 
+    title = (
+        f"Group Activity — Week of "
+        f"{week_start.strftime('%b %d')}–{week_end.strftime('%b %d, %Y')}"
+    )
 
-def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
-    """Generate a heatmap image for the given week. Returns a BytesIO PNG buffer."""
-    matrix, names = _get_week_activity_matrix(week_start)
-
-    week_end = week_start + timedelta(days=6)
-    title = f"Activity Heatmap — Week of {week_start.strftime('%b %d')}–{week_end.strftime('%b %d, %Y')}"
-
-    n_members = len(names) or 1
-    fig_height = max(3, n_members * 0.55 + 1.5)
-
-    fig, ax = plt.subplots(figsize=(9, fig_height))
+    fig, ax = plt.subplots(figsize=(9, 4))
     fig.patch.set_facecolor("#1e1e2e")
     ax.set_facecolor("#1e1e2e")
 
-    cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
-        "fitness", ["#2d2d44", "#5865F2"]
-    )
+    colours = []
+    for i in range(7):
+        if i > today_idx:
+            colours.append("#3a3a55")  # future — muted
+        elif day_counts[i] == 0:
+            colours.append("#44445a")  # zero — dim
+        elif day_counts[i] >= total_active:
+            colours.append("#57F287")  # full house — green
+        else:
+            colours.append("#5865F2")  # partial — blurple
 
-    im = ax.imshow(matrix, aspect="auto", cmap=cmap, vmin=0, vmax=1, interpolation="nearest")
+    bars = ax.bar(range(7), day_counts, color=colours, width=0.6, zorder=3)
+
+    # Label each bar with count
+    for i, (bar, count) in enumerate(zip(bars, day_counts)):
+        if i <= today_idx and count > 0:
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.05,
+                str(count),
+                ha="center", va="bottom", color="white", fontsize=11, fontweight="bold",
+            )
 
     ax.set_xticks(range(7))
-    ax.set_xticklabels(DAY_LABELS, color="white", fontsize=11)
-    ax.set_yticks(range(len(names)))
-    ax.set_yticklabels(names, color="white", fontsize=10)
+    ax.set_xticklabels(DAY_LABELS, color="white", fontsize=12)
+    ax.set_ylabel("Members Active", color="white", fontsize=10)
     ax.tick_params(colors="white", length=0)
+    ax.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+    ax.set_ylim(0, max(total_active + 0.5, max(day_counts) + 1))
+    ax.set_title(title, color="white", fontsize=13, pad=12)
+    ax.grid(axis="y", color="#333355", linewidth=0.7, zorder=0)
 
     for spine in ax.spines.values():
         spine.set_visible(False)
 
-    # Add checkmarks on active cells
-    for i in range(matrix.shape[0]):
-        for j in range(matrix.shape[1]):
-            if matrix[i, j] == 1:
-                ax.text(j, i, "✓", ha="center", va="center", color="white",
-                        fontsize=13, fontweight="bold")
+    # Goal line
+    try:
+        from bot.database import get_setting
+        goal = float(get_setting("goal_days_per_week") or 4)
+    except Exception:
+        goal = 4.0
 
-    ax.set_title(title, color="white", fontsize=13, pad=12)
+    ax.axhline(y=total_active, color="#57F287", linestyle="--", linewidth=1,
+               alpha=0.5, label=f"All {total_active} members")
 
-    # Column totals
-    col_totals = matrix.sum(axis=0)
-    for j, total in enumerate(col_totals):
-        ax.text(j, len(names) - 0.5 + 0.65, f"{int(total)}", ha="center",
-                va="bottom", color="#aaaacc", fontsize=9)
+    # Legend patches
+    legend_patches = [
+        mpatches.Patch(color="#57F287", label=f"All {total_active} active"),
+        mpatches.Patch(color="#5865F2", label="Partial"),
+        mpatches.Patch(color="#44445a", label="Zero"),
+    ]
+    if today_idx < 6:
+        legend_patches.append(mpatches.Patch(color="#3a3a55", label="Upcoming"))
+    ax.legend(
+        handles=legend_patches,
+        facecolor="#2d2d44", labelcolor="white",
+        edgecolor="#555", fontsize=8,
+        loc="upper right",
+    )
 
     plt.tight_layout()
     buf = io.BytesIO()
@@ -109,17 +133,16 @@ def generate_group_trend_chart(since: date) -> io.BytesIO:
     """Line chart of group average days/week over all challenge weeks."""
     from bot.utils.time_utils import all_week_starts
     from bot.utils.streak_utils import compute_group_weekly_average
+    from bot.database import get_setting
 
     week_starts = all_week_starts(since)
     labels = [ws.strftime("%b %d") for ws in week_starts]
     averages = [compute_group_weekly_average(ws)[0] for ws in week_starts]
 
-    goal = 4.0
     try:
-        from bot.database import get_setting
         goal = float(get_setting("goal_days_per_week") or 4)
     except Exception:
-        pass
+        goal = 4.0
 
     fig, ax = plt.subplots(figsize=(10, 4))
     fig.patch.set_facecolor("#1e1e2e")
@@ -137,7 +160,6 @@ def generate_group_trend_chart(since: date) -> io.BytesIO:
     ax.set_xticks(range(len(labels)))
     ax.set_xticklabels(labels, color="white", fontsize=9, rotation=30, ha="right")
     ax.tick_params(colors="white")
-    ax.yaxis.label.set_color("white")
     ax.set_ylabel("Avg Days/Week", color="white")
     ax.set_title("Group Average — Challenge Progress", color="white", fontsize=13)
     ax.legend(facecolor="#2d2d44", labelcolor="white", edgecolor="#555")

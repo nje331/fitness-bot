@@ -97,12 +97,21 @@ class FitnessBot(commands.Bot):
     async def on_ready(self):
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
         logger.info("Connected to %d guild(s).", len(self.guilds))
-        await self.change_presence(
-            activity=discord.Activity(
-                type=discord.ActivityType.watching,
-                name="your gains 💪",
+        if DEBUG:
+            await self.change_presence(
+                status=discord.Status.do_not_disturb,
+                activity=discord.Activity(
+                    type=discord.ActivityType.playing,
+                    name="DEBUG MODE 🛠️",
+                ),
             )
-        )
+        else:
+            await self.change_presence(
+                activity=discord.Activity(
+                    type=discord.ActivityType.watching,
+                    name="/help to get started 💪",
+                ),
+            )
 
     async def on_app_command_error(
         self, interaction: discord.Interaction, error: discord.app_commands.AppCommandError

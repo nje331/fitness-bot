@@ -183,7 +183,22 @@ class UserCog(commands.Cog):
                 inline=False,
             )
 
-        embed.set_footer(text=f"Elite Reward: {elite_reward}")
+        # Debug commands (only shown in debug mode)
+        if self.bot.debug_mode:
+            embed.add_field(
+                name="🛠️ Debug Commands",
+                value=(
+                    "`/nextday` — Log activity for yourself for tomorrow\n"
+                    "`/endweek` — Trigger weekly announcement + DMs now\n"
+                    "`/showsummary` — Post current week heatmap here\n"
+                    "`/triggersunday` — Trigger Sunday wrap-up now"
+                ),
+                inline=False,
+            )
+            embed.set_footer(text=f"⚠️ DEBUG MODE ACTIVE | Elite Reward: {elite_reward}")
+        else:
+            embed.set_footer(text=f"Elite Reward: {elite_reward}")
+
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── /status ───────────────────────────────────────────────────────────────
