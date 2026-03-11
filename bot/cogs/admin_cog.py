@@ -4,7 +4,7 @@ All admin-only.
 
 Key design:
 - Channel selects use Discord ChannelSelect (no ID copying)
-- Member add/deactivate/reactivate use Discord MemberSelect
+- Member add/deactivate/reactivate use Discord UserSelect
 - Settings embeds live-update in place (no ephemeral pop-ups)
 - Toggle buttons flip green <-> red
 - All views disable on timeout
@@ -362,14 +362,14 @@ class MembersView(DisableOnTimeout):
         self._message: Optional[discord.Message] = None
 
     @discord.ui.select(
-        cls=discord.ui.MemberSelect,
+        cls=discord.ui.UserSelect,
         placeholder="➕ Add member to challenge...",
         min_values=1,
         max_values=1,
         row=0,
     )
     async def add_member_select(
-        self, interaction: discord.Interaction, select: discord.ui.MemberSelect
+        self, interaction: discord.Interaction, select: discord.ui.UserSelect
     ):
         member = select.values[0]
         upsert_member(member.id, member.display_name)
@@ -379,14 +379,14 @@ class MembersView(DisableOnTimeout):
         await interaction.response.edit_message(embed=build_members_embed(self.guild), view=view)
 
     @discord.ui.select(
-        cls=discord.ui.MemberSelect,
+        cls=discord.ui.UserSelect,
         placeholder="🚫 Make member inactive...",
         min_values=1,
         max_values=1,
         row=1,
     )
     async def deactivate_member_select(
-        self, interaction: discord.Interaction, select: discord.ui.MemberSelect
+        self, interaction: discord.Interaction, select: discord.ui.UserSelect
     ):
         member = select.values[0]
         set_member_active(member.id, False)
@@ -395,14 +395,14 @@ class MembersView(DisableOnTimeout):
         await interaction.response.edit_message(embed=build_members_embed(self.guild), view=view)
 
     @discord.ui.select(
-        cls=discord.ui.MemberSelect,
+        cls=discord.ui.UserSelect,
         placeholder="✅ Reactivate member...",
         min_values=1,
         max_values=1,
         row=2,
     )
     async def reactivate_member_select(
-        self, interaction: discord.Interaction, select: discord.ui.MemberSelect
+        self, interaction: discord.Interaction, select: discord.ui.UserSelect
     ):
         member = select.values[0]
         upsert_member(member.id, member.display_name)
