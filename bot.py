@@ -110,7 +110,7 @@ class FitnessBot(commands.Bot):
             await self.change_presence(
                 activity=discord.Activity(
                     type=discord.ActivityType.watching,
-                    name="/help to get started 💪",
+                    name="/help",
                 ),
             )
 

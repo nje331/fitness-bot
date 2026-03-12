@@ -85,12 +85,13 @@ class ActivityCog(commands.Cog):
                 try:
                     emoji_id = int(pog_emoji_str.split(":")[-1].rstrip(">"))
                     emoji = discord.utils.get(message.guild.emojis, id=emoji_id)
+                    # logger.debug(str(emoji_id) + ' ' + emoji)
                     if emoji:
                         await message.add_reaction(emoji)
                     else:
-                        await message.add_reaction("🚶")
+                        await message.add_reaction("<:PogU:1481438595133866175>")
                 except (ValueError, IndexError):
-                    await message.add_reaction("🚶")
+                    await message.add_reaction("🔥")
             except discord.HTTPException as e:
                 logger.warning("Failed to react to message: %s", e)
 

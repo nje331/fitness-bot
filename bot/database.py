@@ -97,7 +97,7 @@ DEFAULTS: dict[str, str] = {
     "timezone":             "US/Eastern",
     "challenge_start":      "",
     "challenge_end":        "",
-    "pog_emoji":            "<:PogU:958805527717097473>",
+    "pog_emoji":            "<:PogU:1481438595133866175>",
     "debug":                "0",
 }
 
