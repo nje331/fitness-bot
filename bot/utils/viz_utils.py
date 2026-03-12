@@ -1,15 +1,9 @@
 """
 viz_utils.py — Matplotlib visualizations.
 
-generate_weekly_heatmap: 7×1 colored grid showing how many members
-were active each day of the week. Color scale:
-  - No members active → dim grey (future or zero)
-  - Low activity      → green
-  - Medium activity   → yellow
-  - High activity     → orange
-  - All members active → red
-
-The thresholds scale with total active member count.
+generate_weekly_heatmap:     7×1 colored grid for the group fitness channel post.
+generate_user_activity_chart: Bar chart of a user's daily count per week (for DMs).
+generate_group_trend_chart:  Line chart of group avg days/week over the challenge.
 """
 
 import io
@@ -29,21 +23,16 @@ logger = logging.getLogger(__name__)
 
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-# Colors for the grid cells
-COLOUR_FUTURE  = "#2a2a3e"   # muted — not yet happened
-COLOUR_ZERO    = "#3a3a4e"   # dark grey — nobody active
-COLOUR_LOW     = "#57F287"   # green
-COLOUR_MEDIUM  = "#FEE75C"   # yellow
-COLOUR_HIGH    = "#F0A030"   # orange
-COLOUR_MAX     = "#ED4245"   # red — 100% of members active
+COLOUR_FUTURE  = "#2a2a3e"
+COLOUR_ZERO    = "#3a3a4e"
+COLOUR_LOW     = "#57F287"
+COLOUR_MEDIUM  = "#FEE75C"
+COLOUR_HIGH    = "#F0A030"
+COLOUR_MAX     = "#ED4245"
 COLOUR_BG      = "#1e1e2e"
 
 
 def _day_colour(count: int, total: int) -> str:
-    """
-    Map (count, total) to a grid cell color.
-    Scale: 0=grey, 0<x<33%=green, 33-66%=yellow, 66-99%=orange, 100%=red.
-    """
     if total == 0 or count == 0:
         return COLOUR_ZERO
     ratio = count / total
@@ -58,11 +47,7 @@ def _day_colour(count: int, total: int) -> str:
 
 
 def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
-    """
-    7×1 grid heatmap for the given week.
-    Each cell = one day, colored by proportion of active members.
-    No legend — color meaning is intuitive (green=low, yellow=med, orange=high, red=all).
-    """
+    """7×1 grid heatmap for the given week (group fitness channel post)."""
     week_end = week_start + timedelta(days=6)
 
     with get_conn() as conn:
@@ -86,7 +71,6 @@ def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
 
     title = f"Week of {week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
 
-    # Compact figure — just the grid, no extra margins
     fig, ax = plt.subplots(figsize=(7.5, 1.6))
     fig.patch.set_facecolor(COLOUR_BG)
     ax.set_facecolor(COLOUR_BG)
@@ -118,7 +102,6 @@ def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
         )
         ax.add_patch(rect)
 
-        # Day label
         ax.text(
             x + cell_w / 2, y + cell_h * 0.68,
             DAY_LABELS[i],
@@ -127,7 +110,6 @@ def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
             fontsize=10.5, fontweight="bold", zorder=3,
         )
 
-        # Count (or dash for zero/future)
         if i <= today_idx:
             count_str = str(day_counts[i]) if day_counts[i] > 0 else "–"
             ax.text(
@@ -141,7 +123,6 @@ def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
     ax.set_xlim(-0.05, total_width + 0.05)
     ax.set_ylim(-0.15, cell_h + 0.35)
 
-    # Title above cells
     ax.text(
         total_width / 2, cell_h + 0.22,
         title,
@@ -152,6 +133,97 @@ def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
     plt.tight_layout(pad=0.1)
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def generate_user_activity_chart(user_id: int) -> io.BytesIO | None:
+    """
+    Bar chart of the user's active days per week across the entire challenge.
+    Returns None if there is no challenge start date or fewer than 2 weeks of data.
+    """
+    from bot.utils.time_utils import all_week_starts, challenge_dates
+    from bot.database import get_setting
+
+    start, _ = challenge_dates()
+    if not start:
+        return None
+
+    week_starts = all_week_starts(start)
+    if len(week_starts) < 2:
+        return None
+
+    from bot.database import get_weekly_counts_since
+    counts_map = get_weekly_counts_since(user_id, start)
+    counts = [counts_map.get(ws.isoformat(), 0) for ws in week_starts]
+    labels = [ws.strftime("%-m/%-d") for ws in week_starts]
+
+    try:
+        goal = float(get_setting("goal_days_per_week") or 4)
+        elite = float(get_setting("elite_days_per_week") or 5.5)
+    except Exception:
+        goal = 4.0
+        elite = 5.5
+
+    # Bar colours: red below goal, green at goal, gold at elite
+    bar_colours = []
+    for c in counts:
+        if c >= elite:
+            bar_colours.append("#F1C40F")   # gold
+        elif c >= goal:
+            bar_colours.append("#57F287")   # green
+        else:
+            bar_colours.append("#ED4245")   # red
+
+    fig, ax = plt.subplots(figsize=(max(6, len(week_starts) * 0.7), 3.5))
+    fig.patch.set_facecolor(COLOUR_BG)
+    ax.set_facecolor(COLOUR_BG)
+
+    x = np.arange(len(week_starts))
+    bars = ax.bar(x, counts, color=bar_colours, edgecolor="#11111e", linewidth=0.8, zorder=3)
+
+    # Goal line
+    ax.axhline(y=goal, color="#57F287", linestyle="--", linewidth=1.4,
+               label=f"Goal ({int(goal)}/wk)", zorder=4)
+    # Elite line
+    ax.axhline(y=elite, color="#F1C40F", linestyle=":", linewidth=1.4,
+               label=f"Elite ({elite}/wk)", zorder=4)
+
+    # Value labels on bars
+    for bar, val in zip(bars, counts):
+        if val > 0:
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.1,
+                str(val),
+                ha="center", va="bottom",
+                color="white", fontsize=8, fontweight="bold",
+            )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, color="#aaaacc", fontsize=8,
+                       rotation=45 if len(week_starts) > 8 else 0, ha="right")
+    ax.set_yticks(range(0, 8))
+    ax.tick_params(colors="#aaaacc")
+    ax.set_ylabel("Active Days", color="#aaaacc", fontsize=9)
+    ax.set_ylim(0, 8)
+    ax.set_title("Your Activity — Days per Week", color="white", fontsize=11, fontweight="bold", pad=8)
+    ax.yaxis.grid(True, color="#333355", linestyle="-", linewidth=0.5, zorder=0)
+    ax.set_axisbelow(True)
+
+    legend = ax.legend(
+        facecolor="#2d2d44", labelcolor="white",
+        edgecolor="#555", fontsize=8, loc="upper left",
+    )
+
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#333355")
+
+    plt.tight_layout(pad=0.6)
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=140, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     plt.close(fig)
     buf.seek(0)

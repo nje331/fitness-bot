@@ -89,7 +89,7 @@ class ActivityCog(commands.Cog):
                     if emoji:
                         await message.add_reaction(emoji)
                     else:
-                        await message.add_reaction("<:PogU:1481438595133866175>")
+                        await message.add_reaction("🔥")
                 except (ValueError, IndexError):
                     await message.add_reaction("🔥")
             except discord.HTTPException as e:

@@ -36,7 +36,7 @@ def init_db() -> None:
             username    TEXT    NOT NULL,
             joined_at   TEXT    NOT NULL DEFAULT (date('now')),
             is_active   INTEGER NOT NULL DEFAULT 1,
-            dm_updates  INTEGER NOT NULL DEFAULT 0
+            dm_updates  INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS admins (
@@ -61,8 +61,8 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS photo_of_week (
             week_start   TEXT    PRIMARY KEY,  -- Monday YYYY-MM-DD
             user_id      INTEGER NOT NULL,
-            message_id   INTEGER NOT NULL,
-            channel_id   INTEGER NOT NULL,
+            message_id   INTEGER,
+            channel_id   INTEGER,
             reaction_count INTEGER NOT NULL DEFAULT 0
         );
 
@@ -81,7 +81,23 @@ def init_db() -> None:
 
         INSERT OR IGNORE INTO schema_version (version) VALUES (1);
         """)
+
+    # _run_migrations()
     logger.info("Database initialized at %s", DB_PATH)
+
+
+def _run_migrations() -> None:
+    """Run incremental schema migrations based on schema_version."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT version FROM schema_version").fetchone()
+        version = row["version"] if row else 1
+
+        if version < 2:
+            # Migration 2: flip DMs to opt-out — existing members who never actively
+            # opted out (old default was 0 = off) get switched to 1 = on.
+            conn.execute("UPDATE members SET dm_updates=1 WHERE dm_updates=0")
+            conn.execute("UPDATE schema_version SET version=2")
+            logger.info("Migration 2 applied: dm_updates set to 1 for all existing members.")
 
 
 # ── Settings helpers ──────────────────────────────────────────────────────────
@@ -99,6 +115,7 @@ DEFAULTS: dict[str, str] = {
     "challenge_end":        "",
     "pog_emoji":            "<:PogU:1481438595133866175>",
     "debug":                "0",
+    "last_weekly_sent":     "",            # ISO date (Monday) of last completed weekly send
 }
 
 
@@ -131,7 +148,7 @@ def get_all_settings() -> dict[str, str]:
 def upsert_member(user_id: int, username: str) -> None:
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO members (user_id, username) VALUES (?,?) "
+            "INSERT INTO members (user_id, username, dm_updates) VALUES (?,?,1) "
             "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username",
             (user_id, username),
         )
@@ -257,6 +274,34 @@ def get_weekly_counts_since(user_id: int, since: date) -> dict[str, int]:
     return counts
 
 
+def get_total_activity_count(user_id: int) -> int:
+    """Total verified activity days logged across the entire challenge."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as c FROM activity_logs WHERE user_id=? AND verified>0",
+            (user_id,),
+        ).fetchone()
+        return row["c"] if row else 0
+
+
+def get_most_active_day_of_week(user_id: int) -> Optional[str]:
+    """Returns the day name the user has logged the most activity on, or None."""
+    DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT activity_date FROM activity_logs WHERE user_id=? AND verified>0",
+            (user_id,),
+        ).fetchall()
+    if not rows:
+        return None
+    counts = [0] * 7
+    for r in rows:
+        d = date.fromisoformat(r["activity_date"])
+        counts[d.weekday()] += 1
+    best_idx = counts.index(max(counts))
+    return DAY_NAMES[best_idx] if counts[best_idx] > 0 else None
+
+
 def get_pending_verifications(channel_id: int) -> list[sqlite3.Row]:
     with get_conn() as conn:
         return conn.execute(
@@ -277,7 +322,11 @@ def verify_activity(message_id: int) -> bool:
 # ── Photo of week helpers ─────────────────────────────────────────────────────
 
 def set_photo_of_week(
-    week_start: date, user_id: int, message_id: int, channel_id: int, reaction_count: int
+    week_start: date,
+    user_id: int,
+    message_id: Optional[int],
+    channel_id: Optional[int],
+    reaction_count: int,
 ) -> None:
     with get_conn() as conn:
         conn.execute(
@@ -310,22 +359,36 @@ def get_group_streak() -> sqlite3.Row:
         return conn.execute("SELECT * FROM group_streak WHERE id=1").fetchone()
 
 
-def update_group_streak(success: bool, week_start: date) -> tuple[int, int]:
-    """Increment or reset streak. Returns (current, best)."""
+def update_group_streak(success: bool, week_start: date) -> tuple[int, int, bool]:
+    """
+    Increment or reset streak. Returns (current, best, new_record).
+    new_record is True only when the streak just broke and the ended run exceeded
+    the previous stored best (i.e. a true new all-time record was just set and lost).
+    """
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM group_streak WHERE id=1").fetchone()
         current = row["current"]
         best = row["best"]
+        new_record = False
+
         if success:
             current += 1
-            best = max(best, current)
+            if current > best:
+                best = current
             conn.execute(
                 "UPDATE group_streak SET current=?, best=?, last_success=? WHERE id=1",
                 (current, best, week_start.isoformat()),
             )
         else:
-            conn.execute(
-                "UPDATE group_streak SET current=0 WHERE id=1"
-            )
+            # The streak is breaking — was it a record?
+            if current > best:
+                new_record = True
+                best = current
+                conn.execute(
+                    "UPDATE group_streak SET current=0, best=? WHERE id=1", (best,)
+                )
+            else:
+                conn.execute("UPDATE group_streak SET current=0 WHERE id=1")
             current = 0
-        return current, best
+
+        return current, best, new_record

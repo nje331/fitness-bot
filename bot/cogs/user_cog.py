@@ -52,29 +52,43 @@ class PhotosView(discord.ui.View):
         week_end = week_start + timedelta(days=6)
         week_label = f"{week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
 
+        # Resolve winner name
+        winner_name = f"User {photo['user_id']}"
+        if self.guild_id:
+            guild = self.bot.get_guild(self.guild_id)
+            if guild:
+                member = guild.get_member(photo["user_id"])
+                if member:
+                    winner_name = member.display_name
+
         embed = discord.Embed(
             title=f"📸 Photo of the Week — {week_label}",
             colour=COLOUR_PRIMARY,
         )
+        embed.add_field(name="🏅 Winner", value=winner_name, inline=True)
         embed.add_field(name="Reactions", value=str(photo["reaction_count"]), inline=True)
         embed.add_field(name="Week", value=week_label, inline=True)
         embed.set_footer(text=f"Week {self.page + 1} of {len(self.photos)}")
 
-        # Try to fetch the actual message to get the attachment image URL
+        # Only try to fetch image/jump URL if there's an actual message
         channel_id = photo["channel_id"]
         message_id = photo["message_id"]
+
         if channel_id and message_id:
+            channel_id = int(channel_id)
+            message_id = int(message_id)
+            jump_url = f"https://discord.com/channels/{self.guild_id}/{channel_id}/{message_id}"
             try:
-                ch = self.bot.get_channel(int(channel_id))
+                ch = self.bot.get_channel(channel_id)
                 if ch:
-                    msg = await ch.fetch_message(int(message_id))
+                    msg = await ch.fetch_message(message_id)
                     if msg.attachments:
                         embed.set_image(url=msg.attachments[0].url)
-                    jump_url = f"https://discord.com/channels/{self.guild_id}/{channel_id}/{message_id}"
-                    embed.add_field(name="📎 Original Post", value=f"[Jump to photo]({jump_url})", inline=False)
             except (discord.NotFound, discord.HTTPException):
-                jump_url = f"https://discord.com/channels/{self.guild_id}/{channel_id}/{message_id}"
-                embed.add_field(name="📎 Original Post", value=f"[Jump to photo]({jump_url})", inline=False)
+                pass  # Image just won't show; jump link still useful
+            embed.add_field(name="📎 Original Post", value=f"[Jump to photo]({jump_url})", inline=False)
+        else:
+            embed.description = f"**{winner_name}** was the standout member this week!"
 
         return embed
 
@@ -102,9 +116,8 @@ class PhotosView(discord.ui.View):
         await interaction.response.edit_message(embed=await self.build_embed(), view=self)
 
     def populate_select(self):
-        photos = self.photos
         options = []
-        for i, p in enumerate(photos[:25]):  # Discord max 25
+        for i, p in enumerate(self.photos[:25]):
             ws = date.fromisoformat(p["week_start"])
             label = f"Week of {ws.strftime('%b %d, %Y')}"
             options.append(discord.SelectOption(label=label[:100], value=str(i)))
@@ -136,59 +149,59 @@ class UserCog(commands.Cog):
         )
 
         embed = discord.Embed(
-            title="🏃 Activity Challenge — Help",
+            title="🏃 Activity Challenge — Let's Get Moving",
             colour=COLOUR_PRIMARY,
         )
 
-        # Challenge overview
         embed.add_field(
-            name="🏁 The Challenge",
+            name="🏁 What's the Challenge?",
             value=(
-                f"Get active as many days as possible throughout the challenge!\n"
+                f"Stay active as many days as you can throughout the challenge. "
+                f"Log your workouts, build your streak, and help the group hit the goal together.\n"
                 f"• **Baseline goal:** {goal} days/week average\n"
                 f"• **Elite goal:** {elite} days/week average\n"
-                f"• Hit the goal by the end → you're invited to the **celebratory event** 🎉\n"
+                f"• Hit the goal by the end and you're invited to the **celebratory event** 🎉\n"
                 f"• Ryan & Nathan are matching donations up to **$100 each**!"
             ),
             inline=False,
         )
 
-        # How to log
-        verify_note = "An admin must ✅ react to your photo before it counts." if manual_verify else "Your photo is automatically counted!"
+        verify_note = (
+            "An admin will react ✅ to your photo before it counts — usually quick!"
+            if manual_verify
+            else "Your photo is counted automatically — no waiting needed."
+        )
         embed.add_field(
             name="📸 How to Log Activity",
             value=(
-                f"Post **any activity photo** in {fitness_ch} — a walk, a run, anything that gets you moving.\n"
-                f"• One photo per day counts — multiple posts won't give extra credit.\n"
+                f"Post **any activity photo** in {fitness_ch} — a walk, a run, a gym session, anything that gets you moving.\n"
+                f"• One photo per day earns credit — multiple posts won't stack.\n"
                 f"• Honor system: if you got out and moved, it counts.\n"
                 f"• {verify_note}"
             ),
             inline=False,
         )
 
-        # Photo of the week
         embed.add_field(
             name="🏅 Photo of the Week",
             value=(
-                "Every Monday morning, the most-reacted activity photo from the previous week is crowned **Photo of the Week**.\n"
-                "React to your favorites to help them win!"
+                "Every Monday, the most-reacted activity photo from the previous week gets crowned **Photo of the Week**. "
+                "React to your favorites — it matters."
             ),
             inline=False,
         )
 
-        # User commands
         embed.add_field(
             name="📟 Your Commands",
             value=(
                 "`/help` — This message\n"
-                "`/status` — Your current tier, streak, and weekly average\n"
-                "`/updates` — Toggle DM weekly summaries (opt-in)\n"
+                "`/status` — Your tier, streak, and weekly average\n"
+                "`/updates` — Manage your weekly DM summaries\n"
                 "`/photos` — Browse the Photo of the Week gallery"
             ),
             inline=False,
         )
 
-        # Admin commands (only shown to admins)
         if user_is_admin:
             embed.add_field(
                 name="🔐 Admin Commands",
@@ -202,12 +215,11 @@ class UserCog(commands.Cog):
                 inline=False,
             )
 
-        # Debug commands (only shown in debug mode)
         if self.bot.debug_mode:
             embed.add_field(
                 name="🛠️ Debug Commands",
                 value=(
-                    "`/nextday` — Advance bot's date by 1 day and log your activity\n"
+                    "`/nextday` — Advance bot's date by 1 day\n"
                     "`/resetday` — Reset bot date back to real today\n"
                     "`/endweek` — Trigger weekly announcement + DMs now\n"
                     "`/showsummary` — Post current week heatmap here\n"
@@ -264,14 +276,14 @@ class UserCog(commands.Cog):
 
     # ── /updates ──────────────────────────────────────────────────────────────
 
-    @app_commands.command(name="updates", description="Toggle weekly DM summary updates.")
+    @app_commands.command(name="updates", description="Manage your weekly DM summary updates.")
     async def updates_cmd(self, interaction: discord.Interaction):
         upsert_member(interaction.user.id, interaction.user.display_name)
         member_row = get_member(interaction.user.id)
-        currently_on = member_row["dm_updates"] if member_row else 0
+        currently_on = bool(member_row["dm_updates"]) if member_row else True
 
-        view = UpdatesToggleView(interaction.user.id, bool(currently_on))
-        embed = build_updates_embed(bool(currently_on))
+        view = UpdatesToggleView(interaction.user.id, currently_on)
+        embed = build_updates_embed(currently_on)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     # ── /photos ───────────────────────────────────────────────────────────────
@@ -281,7 +293,7 @@ class UserCog(commands.Cog):
         photos = get_all_photos_of_week()
         if not photos:
             await interaction.response.send_message(
-                embed=base_embed("📸 Photos of the Week", "No photos have been selected yet!"),
+                embed=base_embed("📸 Photos of the Week", "No photos have been selected yet — keep posting! 📷"),
                 ephemeral=True,
             )
             return
@@ -295,14 +307,16 @@ class UserCog(commands.Cog):
 
 def build_updates_embed(enabled: bool) -> discord.Embed:
     status = "✅ **ON**" if enabled else "🔕 **OFF**"
+    toggle_hint = "Use the button below to turn them off." if enabled else "Use the button below to turn them back on."
     embed = base_embed(
-        "📬 DM Weekly Updates",
-        f"Weekly summary DMs are currently: {status}\n\n"
-        "When enabled, you'll receive a personal DM every Monday morning with:\n"
+        "📬 Weekly DM Updates",
+        f"Your weekly summaries are currently: {status}\n\n"
+        "Every Monday you'll get a personal DM with:\n"
         "• Your activity count for the week\n"
-        "• Your daily & weekly streaks\n"
-        "• Your current tier and average\n"
-        "• A motivating message 🚶",
+        "• Daily & weekly streaks\n"
+        "• Your tier, average, and total days logged\n"
+        "• A chart of your activity across the challenge\n\n"
+        f"{toggle_hint}",
     )
     return embed
 

@@ -36,7 +36,7 @@ def tier_colour(tier: str) -> int:
         return COLOUR_ELITE
     elif tier == "Baseline":
         return COLOUR_SUCCESS
-    return COLOUR_ERROR
+    return COLOUR_PRIMARY   # "Keep Pushing" — neutral blue, not alarming red
 
 
 def build_status_embed(
@@ -71,20 +71,24 @@ def build_status_embed(
         value=f"Current: **{weekly_streak}** wks | Best: **{best_weekly}** wks",
         inline=False,
     )
+
     needed_for_goal = max(0, goal - this_week_count)
     needed_for_elite = max(0, elite_goal - this_week_count)
+
     if needed_for_goal > 0:
         e.add_field(
-            name="This Week",
-            value=f"Need **{needed_for_goal:.0f}** more day(s) to hit goal",
+            name="📌 This Week",
+            value=f"**{needed_for_goal:.0f}** more day(s) to hit the goal — you've got this.",
             inline=False,
         )
     elif needed_for_elite > 0:
         e.add_field(
-            name="This Week",
-            value=f"Goal met! Need **{needed_for_elite:.1f}** more for Elite 🏆",
+            name="📌 This Week",
+            value=f"Goal met! 🎯 **{needed_for_elite:.1f}** more day(s) for Elite 🏆",
             inline=False,
         )
     else:
-        e.add_field(name="This Week", value="🏆 Elite goal reached this week!", inline=False)
+        e.add_field(name="📌 This Week", value="🏆 Elite goal reached this week — respect.", inline=False)
+
+    e.set_footer(text="One day at a time. 💪")
     return e

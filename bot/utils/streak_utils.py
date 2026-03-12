@@ -91,7 +91,7 @@ def compute_weekly_average(user_id: int) -> float:
 
 
 def get_user_tier(user_id: int) -> str:
-    """Returns 'Elite', 'Baseline', or 'Below Goal'."""
+    """Returns 'Elite', 'Baseline', or 'Keep Pushing'."""
     avg = compute_weekly_average(user_id)
     elite = float(get_setting("elite_days_per_week") or 5.5)
     goal = float(get_setting("goal_days_per_week") or 4)
@@ -99,7 +99,7 @@ def get_user_tier(user_id: int) -> str:
         return "Elite"
     elif avg >= goal:
         return "Baseline"
-    return "Below Goal"
+    return "Keep Pushing"
 
 
 def compute_group_weekly_average(week_start: date) -> tuple[float, int]:
