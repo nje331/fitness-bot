@@ -12,7 +12,7 @@ Hourly safety check:
 """
 
 import logging
-from datetime import date, timedelta, time as dtime
+from datetime import date, timedelta, datetime, timezone, time as dtime
 from typing import Optional
 import asyncio
 
@@ -35,10 +35,18 @@ from bot.utils.embed_utils import base_embed, COLOUR_SUCCESS, COLOUR_ERROR, COLO
 
 logger = logging.getLogger(__name__)
 
-_MONDAY_8AM_ET = dtime(hour=8, minute=0, tzinfo=pytz.timezone("US/Eastern"))
-_DEBUG_TIME = dtime(hour=18, minute=43, tzinfo=pytz.timezone("US/Eastern"))
-_HOURLY        = dtime(hour=0, minute=0)   # placeholder; loop uses hours=1
+_ET = pytz.timezone("US/Eastern")
 
+
+def et_time(hour: int, minute: int) -> dtime:
+    """Return a UTC-fixed dtime for the given ET wall-clock time (accounts for DST)."""
+    now_et = datetime.now(_ET).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    utc_dt = now_et - now_et.utcoffset()
+    return dtime(hour=utc_dt.hour, minute=utc_dt.minute, tzinfo=timezone.utc)
+
+
+_MONDAY_8AM_ET = et_time(8, 0)
+_DEBUG_TIME    = et_time(19, 28)  # change hour/minute as needed for testing
 
 class SchedulerCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -53,7 +61,7 @@ class SchedulerCog(commands.Cog):
 
     # ── Monday 8 AM loop ──────────────────────────────────────────────────────
 
-    @tasks.loop(time=_DEBUG_TIME)
+    @tasks.loop(time=_MONDAY_8AM_ET)
     async def monday_tasks(self):
         today = today_local()
         if today.weekday() != 3:
@@ -75,7 +83,7 @@ class SchedulerCog(commands.Cog):
     async def hourly_check(self):
         today = today_local()
         last_sent = get_setting("last_weekly_sent")
-        logger.debug("Hourly check: Checking if weekly summary is sent")
+        logger.warning("hourly_check: today=%s weekday=%s last_sent=%s", today, today.weekday(), last_sent)
         if today.weekday() != 0:
             logger.debug("Not Monday, skipping check")
             return
