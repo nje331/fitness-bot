@@ -64,7 +64,7 @@ class SchedulerCog(commands.Cog):
     @tasks.loop(time=_MONDAY_8AM_ET)
     async def monday_tasks(self):
         today = today_local()
-        if today.weekday() != 3:
+        if today.weekday() != 0:
             logger.info(f"Daily Check: Today is {today.weekday()} not Monday, skipping check")
             return
         logger.info("Monday 8 AM task firing.")
