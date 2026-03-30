@@ -126,7 +126,8 @@ class SchedulerCog(commands.Cog):
 
         # Only fire the safety net at 8 AM or later — don't race the scheduled task
         # or send in the middle of the night.
-        now_et = datetime.now(_ET)
+        now_utc = datetime.now()
+        now_et = et_time(now_utc.hour, now_utc.minute)
         if now_et.hour < 8:
             logger.debug("Hourly check: before 8 AM ET, standing by.")
             return
