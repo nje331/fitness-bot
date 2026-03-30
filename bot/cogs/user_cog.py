@@ -13,7 +13,7 @@ from discord.ext import commands
 
 from bot.database import (
     get_setting, get_all_photos_of_week, get_activity_for_week,
-    set_dm_updates, get_member, upsert_member, get_conn,
+    set_dm_updates, get_member, upsert_member, get_conn, is_admin,
 )
 from bot.utils.time_utils import current_week_start, week_start_for, today_local, challenge_dates
 from bot.utils.streak_utils import (
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 class PhotosView(discord.ui.View):
     def __init__(self, photos: list, bot: commands.Bot, guild_id: int, page: int = 0):
         super().__init__(timeout=120)
-        self.photos = photos  # list of DB rows, most recent first
+        self.photos = photos
         self.bot = bot
         self.guild_id = guild_id
         self.page = page
@@ -52,7 +52,6 @@ class PhotosView(discord.ui.View):
         week_end = week_start + timedelta(days=6)
         week_label = f"{week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
 
-        # Resolve winner name
         winner_name = f"User {photo['user_id']}"
         if self.guild_id:
             guild = self.bot.get_guild(self.guild_id)
@@ -70,7 +69,6 @@ class PhotosView(discord.ui.View):
         embed.add_field(name="Week", value=week_label, inline=True)
         embed.set_footer(text=f"Week {self.page + 1} of {len(self.photos)}")
 
-        # Only try to fetch image/jump URL if there's an actual message
         channel_id = photo["channel_id"]
         message_id = photo["message_id"]
 
@@ -85,7 +83,7 @@ class PhotosView(discord.ui.View):
                     if msg.attachments:
                         embed.set_image(url=msg.attachments[0].url)
             except (discord.NotFound, discord.HTTPException):
-                pass  # Image just won't show; jump link still useful
+                pass
             embed.add_field(name="📎 Original Post", value=f"[Jump to photo]({jump_url})", inline=False)
         else:
             embed.description = f"**{winner_name}** was the standout member this week!"
@@ -134,8 +132,6 @@ class UserCog(commands.Cog):
 
     @app_commands.command(name="help", description="Learn about the fitness challenge and bot commands.")
     async def help_cmd(self, interaction: discord.Interaction):
-        from bot.database import is_admin
-
         goal = get_setting("goal_days_per_week") or "4"
         elite = get_setting("elite_days_per_week") or "5.5"
         elite_reward = get_setting("elite_reward_text") or "TBD by admins"
@@ -210,7 +206,9 @@ class UserCog(commands.Cog):
                     "`/settings` — Configure the bot\n"
                     "`/members` — Add/deactivate members\n"
                     "`/addactivity` — Manually credit a user\n"
-                    "`/removeactivity` — Remove a credit"
+                    "`/removeactivity` — Remove a credit\n"
+                    "`/streaks` — View best streaks and totals for all members\n"
+                    "`/status [member]` — View another member's status"
                 ),
                 inline=False,
             )
@@ -235,15 +233,44 @@ class UserCog(commands.Cog):
 
     # ── /status ───────────────────────────────────────────────────────────────
 
-    @app_commands.command(name="status", description="View your current challenge status.")
-    async def status_cmd(self, interaction: discord.Interaction):
-        user = interaction.user
-        upsert_member(user.id, user.display_name)
+    @app_commands.command(name="status", description="View your current challenge status (admins can view any member).")
+    @app_commands.describe(member="[Admin only] View another member's status.")
+    async def status_cmd(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member | None = None,
+    ):
+        invoker = interaction.user
 
-        member_row = get_member(user.id)
+        # Permission check: only admins can look up other members
+        if member is not None and member.id != invoker.id:
+            is_invoker_admin = (
+                is_admin(invoker.id)
+                or invoker.guild_permissions.administrator
+            )
+            if not is_invoker_admin:
+                await interaction.response.send_message(
+                    embed=error_embed(
+                        "Not Allowed",
+                        "You can only view your own status. Run `/status` with no parameters to see yours.",
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+        # Default to self
+        target = member or invoker
+        upsert_member(target.id, target.display_name)
+
+        member_row = get_member(target.id)
         if member_row and not member_row["is_active"]:
+            msg = (
+                "You're currently marked as inactive in the challenge."
+                if target.id == invoker.id
+                else f"**{target.display_name}** is currently marked as inactive."
+            )
             await interaction.response.send_message(
-                embed=error_embed("Inactive Member", "You're currently marked as inactive in the challenge."),
+                embed=error_embed("Inactive Member", msg),
                 ephemeral=True,
             )
             return
@@ -251,17 +278,17 @@ class UserCog(commands.Cog):
         goal = float(get_setting("goal_days_per_week") or 4)
         elite_goal = float(get_setting("elite_days_per_week") or 5.5)
 
-        avg = compute_weekly_average(user.id)
-        tier = get_user_tier(user.id)
-        daily_streak, best_daily = compute_daily_streak(user.id)
-        weekly_streak, best_weekly = compute_weekly_streak(user.id)
+        avg = compute_weekly_average(target.id)
+        tier = get_user_tier(target.id)
+        daily_streak, best_daily = compute_daily_streak(target.id)
+        weekly_streak, best_weekly = compute_weekly_streak(target.id)
 
         week_start = current_week_start()
-        this_week_rows = get_activity_for_week(user.id, week_start)
+        this_week_rows = get_activity_for_week(target.id, week_start)
         this_week_count = len(this_week_rows)
 
         embed = build_status_embed(
-            member=user,
+            member=target,
             tier=tier,
             daily_streak=daily_streak,
             best_daily=best_daily,
@@ -272,6 +299,11 @@ class UserCog(commands.Cog):
             goal=goal,
             elite_goal=elite_goal,
         )
+
+        # If an admin looked up another user, note it subtly in the footer
+        if target.id != invoker.id:
+            embed.set_footer(text=f"Viewed by {invoker.display_name} 💪")
+
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── /updates ──────────────────────────────────────────────────────────────

@@ -1,6 +1,12 @@
 """
 streak_utils.py — Streak calculations derived from the database.
-Always recalculates from stored dates so manual additions/deletions are reflected correctly.
+
+Streak display philosophy:
+  - Daily: show the running streak value all day even if the user hasn't logged
+    yet today. Only drop to 0 the *following* day after a missed day (or two
+    missed days when grace_days=1).
+  - Weekly: show the running weekly streak right up until the week ends without
+    hitting the goal. An in-progress week is never penalised.
 """
 
 from datetime import date, timedelta
@@ -11,6 +17,14 @@ from bot.utils.time_utils import challenge_dates, all_week_starts, today_local, 
 def compute_daily_streak(user_id: int) -> tuple[int, int]:
     """
     Returns (current_streak, best_streak) counting consecutive active days.
+
+    "Current" reflects the streak value the user has earned so far:
+    - If the user logged today → streak includes today.
+    - If the user hasn't logged today but yesterday's streak is still intact →
+      the streak shows yesterday's value (still alive, today not yet gone).
+    - The streak only drops to 0 once the allowed gap has been exceeded
+      (i.e. gap > 1 normally, or gap > 2 with one grace day).
+
     Grace days: if setting is 1, a single-day gap does not break the streak.
     """
     grace = int(get_setting("grace_days") or 0)
@@ -33,12 +47,15 @@ def compute_daily_streak(user_id: int) -> tuple[int, int]:
 
     best = max(best, current)
 
-    # Is the streak still alive? (gap from last date to today)
+    # Is the streak still alive as of today?
+    # A streak is alive if the gap from the last log to today is within tolerance.
+    # This means: if you haven't logged today but logged yesterday, streak is ALIVE
+    # and shows the current run length. It only dies the day AFTER the grace window closes.
     last = dates[-1]
     today = today_local()
     gap_to_today = (today - last).days
-    alive = gap_to_today == 0 or (grace >= 1 and gap_to_today <= 2)
-    if not alive:
+    max_allowed_gap = 1 if grace == 0 else 2  # gap_to_today == 1 means "logged yesterday"
+    if gap_to_today > max_allowed_gap:
         current = 0
 
     return current, best
@@ -47,7 +64,9 @@ def compute_daily_streak(user_id: int) -> tuple[int, int]:
 def compute_weekly_streak(user_id: int) -> tuple[int, int]:
     """
     Returns (current_weekly_streak, best_weekly_streak).
-    A week counts if the user hit the goal days/week threshold.
+    A completed week counts if the user hit the goal days/week threshold.
+    The current in-progress week is never penalised — the streak stays at its
+    last completed value until the week actually ends without hitting the goal.
     """
     start, _ = challenge_dates()
     if not start:
@@ -57,21 +76,21 @@ def compute_weekly_streak(user_id: int) -> tuple[int, int]:
     weekly_counts = get_weekly_counts_since(user_id, start)
     week_starts = all_week_starts(start)
 
+    this_week = week_start_for(today_local())
+
     best = 0
     current = 0
     for ws in week_starts:
+        if ws == this_week:
+            # In-progress week: don't penalise even if they haven't hit the goal yet.
+            # The streak holds at whatever it was coming into this week.
+            break
         count = weekly_counts.get(ws.isoformat(), 0)
         if count >= goal:
             current += 1
             best = max(best, current)
         else:
             current = 0
-
-    # Check if current week should still be considered "in progress"
-    this_week = week_start_for(today_local())
-    if week_starts and week_starts[-1] == this_week:
-        # Don't penalize the in-progress week
-        pass
 
     return current, best
 
@@ -107,7 +126,7 @@ def compute_group_weekly_average(week_start: date) -> tuple[float, int]:
     Returns (average_days, active_member_count) for all active members that week.
     """
     from datetime import timedelta
-    from bot.database import get_conn, get_active_members
+    from bot.database import get_conn
 
     week_end = week_start + timedelta(days=6)
     with get_conn() as conn:

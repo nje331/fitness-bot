@@ -5,10 +5,11 @@ Monday 8 AM ET:
   1. Weekly heatmap + group summary posted to fitness channel
   2. Group trend chart posted alongside the heatmap
   3. Photo of the Week selected and announced
-  4. Personal DM summaries sent to opted-out members (opt-out now)
+  4. Personal DM summaries sent to opted-in members
 
 Hourly safety check:
-  - If it's Monday and the weekly send hasn't fired yet today, trigger it.
+  - If it's Monday AND the hour is >= 8 AND the weekly send hasn't fired yet today, trigger it.
+  - The 8 AM task always sets last_weekly_sent before the next hourly tick, preventing double-sends.
 """
 
 import logging
@@ -46,7 +47,7 @@ def et_time(hour: int, minute: int) -> dtime:
 
 
 _MONDAY_8AM_ET = et_time(8, 0)
-_DEBUG_TIME    = et_time(19, 28)  # change hour/minute as needed for testing
+
 
 class SchedulerCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -59,19 +60,51 @@ class SchedulerCog(commands.Cog):
         self.monday_tasks.cancel()
         self.hourly_check.cancel()
 
+    # ── Admin channel helpers ─────────────────────────────────────────────────
+
+    async def _get_admin_channel(self) -> Optional[discord.TextChannel]:
+        cid = get_setting("admin_channel_id")
+        if not cid:
+            return None
+        ch = self.bot.get_channel(int(cid))
+        return ch if isinstance(ch, discord.TextChannel) else None
+
+    async def _admin_log(self, message: str = "", embed: discord.Embed = None):
+        try:
+            ch = await self._get_admin_channel()
+            if ch:
+                await ch.send(content=message or None, embed=embed)
+            else:
+                logger.info("Admin log (no channel): %s", message)
+        except Exception as e:
+            logger.warning("Failed to post admin log: %s", e)
+
+    async def _admin_error(self, title: str, description: str):
+        from bot.utils.embed_utils import error_embed
+        embed = error_embed(title, description)
+        ch = await self._get_admin_channel()
+        if ch:
+            try:
+                await ch.send(embed=embed)
+            except Exception as e:
+                logger.warning("Failed to post admin error: %s", e)
+        logger.error("Admin error — %s: %s", title, description)
+
     # ── Monday 8 AM loop ──────────────────────────────────────────────────────
 
     @tasks.loop(time=_MONDAY_8AM_ET)
     async def monday_tasks(self):
         today = today_local()
         if today.weekday() != 0:
-            logger.info(f"Daily Check: Today is {today.weekday()} not Monday, skipping check")
+            logger.info("Daily Check: weekday=%d not Monday, skipping.", today.weekday())
             return
         logger.info("Monday 8 AM task firing.")
         prev_monday = today - timedelta(days=7)
         week_start = week_start_for(prev_monday)
-        await self._run_weekly(week_start)
+        # Set the flag BEFORE running so the hourly check (if it fires concurrently)
+        # will see it and skip. _run_weekly is idempotent for the same week_start.
         set_setting("last_weekly_sent", today.isoformat())
+        await self._run_weekly(week_start)
 
     @monday_tasks.before_loop
     async def before_monday_tasks(self):
@@ -83,18 +116,26 @@ class SchedulerCog(commands.Cog):
     async def hourly_check(self):
         today = today_local()
         last_sent = get_setting("last_weekly_sent")
-        logger.warning("hourly_check: today=%s weekday=%s last_sent=%s", today, today.weekday(), last_sent)
+        logger.debug("hourly_check: today=%s weekday=%s last_sent=%s", today, today.weekday(), last_sent)
+
         if today.weekday() != 0:
-            logger.debug("Not Monday, skipping check")
-            return
+            return  # Not Monday
+
         if last_sent == today.isoformat():
             return  # Already sent today
-        # It's Monday and we haven't sent yet — fire it now
-        logger.warning("Hourly check: Monday weekly send not yet recorded — triggering now.")
+
+        # Only fire the safety net at 8 AM or later — don't race the scheduled task
+        # or send in the middle of the night.
+        now_et = datetime.now(_ET)
+        if now_et.hour < 8:
+            logger.debug("Hourly check: before 8 AM ET, standing by.")
+            return
+
+        logger.warning("Hourly check: Monday send not recorded — triggering safety send now.")
         prev_monday = today - timedelta(days=7)
         week_start = week_start_for(prev_monday)
-        await self._run_weekly(week_start)
         set_setting("last_weekly_sent", today.isoformat())
+        await self._run_weekly(week_start)
 
     @hourly_check.before_loop
     async def before_hourly_check(self):
@@ -122,6 +163,7 @@ class SchedulerCog(commands.Cog):
         fitness_ch = await self._get_fitness_channel()
         if not fitness_ch:
             logger.warning("No fitness channel set; skipping heatmap.")
+            await self._admin_error("Weekly Send Failed", "No fitness channel configured — heatmap not posted.")
             return
 
         week_end = week_start + timedelta(days=6)
@@ -136,8 +178,7 @@ class SchedulerCog(commands.Cog):
 
         if success:
             if current_streak == 1:
-                # First week or returning after a miss
-                streak_line = f"✅ **We're back!** The group hit the goal this week — the streak is alive. Let's string some weeks together. 💪"
+                streak_line = "✅ **We're back!** The group hit the goal this week — the streak is alive. Let's string some weeks together. 💪"
             else:
                 streak_line = f"✅ **We did it again!** {current_streak} weeks in a row and counting. The group is on a roll. 🔥"
         else:
@@ -180,16 +221,18 @@ class SchedulerCog(commands.Cog):
             files.append(heatmap_file)
         except Exception as e:
             logger.warning("Heatmap generation failed: %s", e)
+            await self._admin_error("Heatmap Generation Failed", str(e))
 
         await fitness_ch.send(embed=embed, files=files if files else discord.utils.MISSING)
 
-        # Post trend chart as a follow-up if challenge start is configured
+        # Trend chart — exclude the current (in-progress) week so the chart only
+        # shows completed weeks.
         start_str = get_setting("challenge_start")
         if start_str:
             try:
                 from datetime import date as _date
                 challenge_start = _date.fromisoformat(start_str)
-                trend_buf = generate_group_trend_chart(challenge_start)
+                trend_buf = generate_group_trend_chart(challenge_start, until=week_start)
                 trend_file = discord.File(trend_buf, filename="trend.png")
                 trend_embed = discord.Embed(
                     title="📈 Challenge Progress — Group Avg by Week",
@@ -200,6 +243,7 @@ class SchedulerCog(commands.Cog):
                 await fitness_ch.send(embed=trend_embed, file=trend_file)
             except Exception as e:
                 logger.warning("Trend chart failed: %s", e)
+                await self._admin_error("Trend Chart Failed", str(e))
 
         logger.info("Weekly summary posted. avg=%.2f success=%s streak=%d", avg, success, current_streak)
 
@@ -244,7 +288,6 @@ class SchedulerCog(commands.Cog):
             except (discord.NotFound, discord.HTTPException) as e:
                 logger.warning("Couldn't fetch message %s: %s", row["message_id"], e)
 
-        # Fall back to first row with a valid user if no messages found
         if best_msg_id is None:
             for row in rows:
                 best_user_id = row["user_id"]
@@ -260,10 +303,7 @@ class SchedulerCog(commands.Cog):
         winner_name = winner.display_name if winner else f"User {best_user_id}"
         week_label = f"{week_start.strftime('%b %d')} – {(week_start + timedelta(days=6)).strftime('%b %d, %Y')}"
 
-        embed = discord.Embed(
-            title="📸 Photo of the Week!",
-            colour=COLOUR_ELITE,
-        )
+        embed = discord.Embed(title="📸 Photo of the Week!", colour=COLOUR_ELITE)
 
         if best_msg_id is not None:
             embed.description = (
@@ -291,7 +331,6 @@ class SchedulerCog(commands.Cog):
 
     async def _send_dm_summaries(self, week_start: date):
         with get_conn() as conn:
-            # dm_updates=1 means opted IN (default); members can opt OUT by setting to 0
             members = conn.execute(
                 "SELECT * FROM members WHERE is_active=1 AND dm_updates=1"
             ).fetchall()
@@ -299,17 +338,44 @@ class SchedulerCog(commands.Cog):
         goal = float(get_setting("goal_days_per_week") or 4)
         elite_goal = float(get_setting("elite_days_per_week") or 5.5)
 
+        sent_to: list[str] = []
+        errors: list[str] = []
+
         for m in members:
             try:
-                await self._dm_user_summary(m["user_id"], week_start, goal, elite_goal)
+                username = await self._dm_user_summary(m["user_id"], week_start, goal, elite_goal)
+                sent_to.append(username)
             except Exception as e:
+                err_msg = f"{m['username']} (ID {m['user_id']}): {e}"
+                errors.append(err_msg)
                 logger.warning("Failed to DM user %s: %s", m["user_id"], e)
 
-    async def _dm_user_summary(self, user_id: int, week_start: date, goal: float, elite_goal: float):
+        # Admin log
+        week_label = f"{week_start.strftime('%b %d')} – {(week_start + timedelta(days=6)).strftime('%b %d, %Y')}"
+        embed = discord.Embed(
+            title="📬 Weekly DMs Sent",
+            colour=COLOUR_SUCCESS if not errors else COLOUR_WARNING,
+        )
+        embed.add_field(
+            name=f"✅ Delivered ({len(sent_to)})",
+            value="\n".join(f"• {n}" for n in sent_to) if sent_to else "—",
+            inline=False,
+        )
+        if errors:
+            embed.add_field(
+                name=f"⚠️ Failed ({len(errors)})",
+                value="\n".join(f"• {e}" for e in errors),
+                inline=False,
+            )
+        embed.set_footer(text=f"Week of {week_label}")
+        await self._admin_log(embed=embed)
+
+    async def _dm_user_summary(self, user_id: int, week_start: date, goal: float, elite_goal: float) -> str:
+        """Send weekly DM to one user. Returns display name. Raises on failure."""
         from bot.database import get_activity_for_week
         user = await self.bot.fetch_user(user_id)
         if user is None:
-            return
+            raise ValueError("User not found")
 
         week_days = get_activity_for_week(user_id, week_start)
         this_week_count = len(week_days)
@@ -324,7 +390,6 @@ class SchedulerCog(commands.Cog):
         hit_elite = this_week_count >= elite_goal
         colour = COLOUR_SUCCESS if hit_goal else COLOUR_ERROR
 
-        # ── Main motivational message ─────────────────────────────────────────
         if this_week_count == 0:
             message = (
                 "No activity logged this week — life happens, no judgment. "
@@ -342,65 +407,34 @@ class SchedulerCog(commands.Cog):
             )
         else:
             days_short = goal - this_week_count
-            if days_short <= 1:
-                proximity = "a day away"
-            elif days_short <= 2:
-                proximity = "a couple days away"
-            else:
-                proximity = "a few days away"
-
-            # Check if they were close to elite (within 1 day)
+            proximity = "a day away" if days_short <= 1 else ("a couple days away" if days_short <= 2 else "a few days away")
             days_from_elite = elite_goal - this_week_count
             if this_week_count >= goal - 1 and days_from_elite <= 1:
-                elite_nudge = f" You were just a day away from Elite status too — that's within reach."
+                elite_nudge = " You were just a day away from Elite status too — that's within reach."
             elif this_week_count >= 5:
                 elite_nudge = f" At {this_week_count} days you're knocking on Elite's door — a few strong weeks and you'll be right on track!"
             else:
                 elite_nudge = " A few strong weeks and you'll be right on track!"
+            message = f"You logged **{this_week_count}** day(s) this week — {proximity} from the goal.{elite_nudge}"
 
-            message = (
-                f"You logged **{this_week_count}** day(s) this week — {proximity} from the goal.{elite_nudge}"
-            )
+        embed = discord.Embed(title="📊 Your Weekly Summary", description=message, colour=colour)
 
-        embed = discord.Embed(
-            title="📊 Your Weekly Summary",
-            description=message,
-            colour=colour,
-        )
-
-        # ── Stats fields ──────────────────────────────────────────────────────
         tier_emoji = "🥇" if tier == "Elite" else ("🎯" if tier == "Baseline" else "📈")
         embed.add_field(name="This Week", value=f"**{this_week_count}** active days", inline=True)
         embed.add_field(name="Weekly Avg", value=f"**{avg}** days/wk", inline=True)
         embed.add_field(name="Tier", value=f"{tier_emoji} **{tier}**", inline=True)
-        embed.add_field(
-            name="🔥 Daily Streak",
-            value=f"Current: **{daily_streak}** | Best: **{best_daily}**",
-            inline=False,
-        )
-        embed.add_field(
-            name="📅 Weekly Streak",
-            value=f"Current: **{weekly_streak}** wks | Best: **{best_weekly}** wks",
-            inline=False,
-        )
-        embed.add_field(
-            name="🏆 Total Days Logged",
-            value=f"**{total_days}** days since the challenge started",
-            inline=False,
-        )
+        embed.add_field(name="🔥 Daily Streak", value=f"Current: **{daily_streak}** | Best: **{best_daily}**", inline=False)
+        embed.add_field(name="📅 Weekly Streak", value=f"Current: **{weekly_streak}** wks | Best: **{best_weekly}** wks", inline=False)
+        embed.add_field(name="🏆 Total Days Logged", value=f"**{total_days}** days since the challenge started", inline=False)
         if best_day:
-            embed.add_field(
-                name="📆 Your Strongest Day",
-                value=f"You tend to show up most on **{best_day}s** — lean into it.",
-                inline=False,
-            )
+            embed.add_field(name="📆 Your Strongest Day", value=f"You tend to show up most on **{best_day}s** — lean into it.", inline=False)
 
         embed.set_footer(text="Want to stop receiving these? Use /updates in the server.")
 
-        # ── Activity chart ────────────────────────────────────────────────────
         files = []
         try:
-            chart_buf = generate_user_activity_chart(user_id)
+            # Exclude current week so the chart only shows completed data
+            chart_buf = generate_user_activity_chart(user_id, exclude_current_week=True)
             if chart_buf:
                 chart_file = discord.File(chart_buf, filename="activity.png")
                 embed.set_image(url="attachment://activity.png")
@@ -410,15 +444,13 @@ class SchedulerCog(commands.Cog):
 
         await user.send(embed=embed, files=files if files else discord.utils.MISSING)
         logger.info("DM summary sent to user %s", user_id)
+        return user.display_name
 
     # ── Public trigger methods (used by debug cog) ────────────────────────────
 
     async def trigger_end_week(self, use_current_week: bool = False):
         today = today_local()
-        if use_current_week:
-            week_start = week_start_for(today)
-        else:
-            week_start = week_start_for(today - timedelta(days=7))
+        week_start = week_start_for(today) if use_current_week else week_start_for(today - timedelta(days=7))
         await self._run_weekly(week_start)
 
     async def trigger_sunday(self):
@@ -434,15 +466,13 @@ class SchedulerCog(commands.Cog):
         goal = float(get_setting("goal_days_per_week") or 4)
         success = avg >= goal
 
-        description = (
-            f"**Group avg:** {avg} days/member  •  "
-            f"**Goal:** {goal} days/wk  •  "
-            f"**Members:** {member_count}"
-        )
-
         embed = discord.Embed(
             title=f"📊 Current Week — {week_label}",
-            description=description,
+            description=(
+                f"**Group avg:** {avg} days/member  •  "
+                f"**Goal:** {goal} days/wk  •  "
+                f"**Members:** {member_count}"
+            ),
             colour=COLOUR_SUCCESS if success else COLOUR_ERROR,
         )
         embed.set_footer(text="💪 Activity Challenge Bot")

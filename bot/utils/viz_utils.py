@@ -1,14 +1,17 @@
 """
 viz_utils.py — Matplotlib visualizations.
 
-generate_weekly_heatmap:     7×1 colored grid for the group fitness channel post.
+generate_weekly_heatmap:      7×1 colored grid for the group fitness channel post.
 generate_user_activity_chart: Bar chart of a user's daily count per week (for DMs).
-generate_group_trend_chart:  Line chart of group avg days/week over the challenge.
+                               Pass exclude_current_week=True to omit the in-progress week.
+generate_group_trend_chart:   Line chart of group avg days/week over the challenge.
+                               Pass until=<date> to exclude weeks at or after that date.
 """
 
 import io
 import logging
 from datetime import date, timedelta
+from typing import Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -139,23 +142,35 @@ def generate_weekly_heatmap(week_start: date) -> io.BytesIO:
     return buf
 
 
-def generate_user_activity_chart(user_id: int) -> io.BytesIO | None:
+def generate_user_activity_chart(
+    user_id: int,
+    exclude_current_week: bool = False,
+) -> Optional[io.BytesIO]:
     """
     Bar chart of the user's active days per week across the entire challenge.
+
+    Args:
+        exclude_current_week: If True, the in-progress (current) week is omitted
+            so the chart only reflects completed weeks.
+
     Returns None if there is no challenge start date or fewer than 2 weeks of data.
     """
     from bot.utils.time_utils import all_week_starts, challenge_dates
-    from bot.database import get_setting
+    from bot.database import get_setting, get_weekly_counts_since
 
     start, _ = challenge_dates()
     if not start:
         return None
 
     week_starts = all_week_starts(start)
+
+    if exclude_current_week:
+        current_week = week_start_for(today_local())
+        week_starts = [ws for ws in week_starts if ws < current_week]
+
     if len(week_starts) < 2:
         return None
 
-    from bot.database import get_weekly_counts_since
     counts_map = get_weekly_counts_since(user_id, start)
     counts = [counts_map.get(ws.isoformat(), 0) for ws in week_starts]
     labels = [ws.strftime("%-m/%-d") for ws in week_starts]
@@ -167,7 +182,6 @@ def generate_user_activity_chart(user_id: int) -> io.BytesIO | None:
         goal = 4.0
         elite = 5.5
 
-    # Bar colours: red below goal, green at goal, gold at elite
     bar_colours = []
     for c in counts:
         if c >= elite:
@@ -184,14 +198,11 @@ def generate_user_activity_chart(user_id: int) -> io.BytesIO | None:
     x = np.arange(len(week_starts))
     bars = ax.bar(x, counts, color=bar_colours, edgecolor="#11111e", linewidth=0.8, zorder=3)
 
-    # Goal line
     ax.axhline(y=goal, color="#57F287", linestyle="--", linewidth=1.4,
                label=f"Goal ({int(goal)}/wk)", zorder=4)
-    # Elite line
     ax.axhline(y=elite, color="#F1C40F", linestyle=":", linewidth=1.4,
                label=f"Elite ({elite}/wk)", zorder=4)
 
-    # Value labels on bars
     for bar, val in zip(bars, counts):
         if val > 0:
             ax.text(
@@ -209,11 +220,11 @@ def generate_user_activity_chart(user_id: int) -> io.BytesIO | None:
     ax.tick_params(colors="#aaaacc")
     ax.set_ylabel("Active Days", color="#aaaacc", fontsize=9)
     ax.set_ylim(0, 8)
-    ax.set_title("Your Activity — Days per Week", color="white", fontsize=11, fontweight="bold", pad=8)
+    ax.set_title("Your Activity — Days per Week (Completed Weeks)", color="white", fontsize=11, fontweight="bold", pad=8)
     ax.yaxis.grid(True, color="#333355", linestyle="-", linewidth=0.5, zorder=0)
     ax.set_axisbelow(True)
 
-    legend = ax.legend(
+    ax.legend(
         facecolor="#2d2d44", labelcolor="white",
         edgecolor="#555", fontsize=8, loc="upper left",
     )
@@ -230,13 +241,32 @@ def generate_user_activity_chart(user_id: int) -> io.BytesIO | None:
     return buf
 
 
-def generate_group_trend_chart(since: date) -> io.BytesIO:
-    """Line chart of group average days/week over all challenge weeks."""
+def generate_group_trend_chart(
+    since: date,
+    until: Optional[date] = None,
+) -> io.BytesIO:
+    """
+    Line chart of group average days/week over all challenge weeks.
+
+    Args:
+        since: Challenge start date.
+        until: Exclusive upper bound. Weeks at or after this date are omitted.
+               Defaults to the current week start so in-progress data is excluded.
+    """
     from bot.utils.time_utils import all_week_starts
     from bot.utils.streak_utils import compute_group_weekly_average
     from bot.database import get_setting
 
-    week_starts = all_week_starts(since)
+    # Default: exclude the current in-progress week
+    if until is None:
+        until = week_start_for(today_local())
+
+    week_starts = [ws for ws in all_week_starts(since) if ws < until]
+
+    if not week_starts:
+        # Fallback: render an empty chart rather than crashing
+        week_starts = all_week_starts(since)
+
     labels = [ws.strftime("%b %d") for ws in week_starts]
     averages = [compute_group_weekly_average(ws)[0] for ws in week_starts]
 
@@ -262,7 +292,7 @@ def generate_group_trend_chart(since: date) -> io.BytesIO:
     ax.set_xticklabels(labels, color="white", fontsize=9, rotation=30, ha="right")
     ax.tick_params(colors="white")
     ax.set_ylabel("Avg Days/Week", color="white")
-    ax.set_title("Group Average — Challenge Progress", color="white", fontsize=13)
+    ax.set_title("Group Average — Challenge Progress (Completed Weeks)", color="white", fontsize=13)
     ax.legend(facecolor="#2d2d44", labelcolor="white", edgecolor="#555")
 
     for spine in ax.spines.values():

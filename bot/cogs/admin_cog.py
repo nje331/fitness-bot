@@ -8,6 +8,7 @@ Key design:
 - Settings embeds live-update in place (no ephemeral pop-ups)
 - Toggle buttons flip green <-> red
 - All views disable on timeout
+- Every admin action posts a summary to the admin channel
 """
 
 import discord
@@ -21,18 +22,38 @@ from bot.database import (
     add_admin, remove_admin, get_admins, is_admin,
     get_setting, set_setting, get_all_settings,
     upsert_member, set_member_active, get_conn,
+    get_total_activity_count,
 )
 from bot.utils.checks import is_bot_admin
-from bot.utils.embed_utils import base_embed, error_embed, COLOUR_PRIMARY
+from bot.utils.embed_utils import base_embed, error_embed, success_embed, COLOUR_PRIMARY, COLOUR_WARNING
 
 logger = logging.getLogger(__name__)
+
+
+# ── Admin channel helper (module-level so views can use it) ──────────────────
+
+async def _post_admin_log(bot: commands.Bot, embed: discord.Embed) -> None:
+    """Post an embed to the admin channel. Silently skips if not configured."""
+    try:
+        cid = get_setting("admin_channel_id")
+        if not cid:
+            return
+        ch = bot.get_channel(int(cid))
+        if isinstance(ch, discord.TextChannel):
+            await ch.send(embed=embed)
+    except Exception as e:
+        logger.warning("Failed to post admin log: %s", e)
+
+
+async def _post_admin_error(bot: commands.Bot, title: str, description: str) -> None:
+    embed = error_embed(title, description)
+    await _post_admin_log(bot, embed)
+    logger.error("Admin error — %s: %s", title, description)
 
 
 # ── Shared timeout mixin ──────────────────────────────────────────────────────
 
 class DisableOnTimeout(discord.ui.View):
-    """View that disables all its children when it times out."""
-
     async def on_timeout(self):
         for child in self.children:
             child.disabled = True
@@ -46,18 +67,19 @@ class DisableOnTimeout(discord.ui.View):
 # ─── /admins ──────────────────────────────────────────────────────────────────
 
 class AdminsView(DisableOnTimeout):
-    def __init__(self, guild: discord.Guild):
+    def __init__(self, guild: discord.Guild, bot: commands.Bot):
         super().__init__(timeout=180)
         self.guild = guild
+        self.bot = bot
         self._message: Optional[discord.Message] = None
 
     @discord.ui.button(label="➕ Add Admin", style=discord.ButtonStyle.green)
     async def add_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AddAdminModal(self.guild, self._message))
+        await interaction.response.send_modal(AddAdminModal(self.guild, self.bot, self._message))
 
     @discord.ui.button(label="➖ Remove Admin", style=discord.ButtonStyle.red)
     async def remove_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(RemoveAdminModal(self.guild, self._message))
+        await interaction.response.send_modal(RemoveAdminModal(self.guild, self.bot, self._message))
 
 
 class AddAdminModal(discord.ui.Modal, title="Add Admin"):
@@ -67,9 +89,10 @@ class AddAdminModal(discord.ui.Modal, title="Add Admin"):
         required=True,
     )
 
-    def __init__(self, guild: discord.Guild, message: Optional[discord.Message]):
+    def __init__(self, guild: discord.Guild, bot: commands.Bot, message: Optional[discord.Message]):
         super().__init__()
         self.guild = guild
+        self.bot = bot
         self._message = message
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -89,9 +112,15 @@ class AddAdminModal(discord.ui.Modal, title="Add Admin"):
             return
         add_admin(uid, interaction.user.id)
         upsert_member(uid, member.display_name)
-        embed, view = build_admins_embed_view(self.guild)
+
+        embed = discord.Embed(title="🔐 Admin Added", colour=COLOUR_PRIMARY)
+        embed.add_field(name="New Admin", value=f"{member.mention} (`{uid}`)", inline=True)
+        embed.add_field(name="Added By", value=interaction.user.mention, inline=True)
+        await _post_admin_log(self.bot, embed)
+
+        embed2, view = build_admins_embed_view(self.guild, self.bot)
         view._message = self._message
-        await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.response.edit_message(embed=embed2, view=view)
 
 
 class RemoveAdminModal(discord.ui.Modal, title="Remove Admin"):
@@ -101,9 +130,10 @@ class RemoveAdminModal(discord.ui.Modal, title="Remove Admin"):
         required=True,
     )
 
-    def __init__(self, guild: discord.Guild, message: Optional[discord.Message]):
+    def __init__(self, guild: discord.Guild, bot: commands.Bot, message: Optional[discord.Message]):
         super().__init__()
         self.guild = guild
+        self.bot = bot
         self._message = message
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -118,13 +148,21 @@ class RemoveAdminModal(discord.ui.Modal, title="Remove Admin"):
                 embed=error_embed("Can't remove yourself"), ephemeral=True
             )
             return
+        member = self.guild.get_member(uid)
+        member_name = member.display_name if member else f"User {uid}"
         remove_admin(uid)
-        embed, view = build_admins_embed_view(self.guild)
+
+        embed = discord.Embed(title="🔐 Admin Removed", colour=COLOUR_WARNING)
+        embed.add_field(name="Removed", value=f"{member_name} (`{uid}`)", inline=True)
+        embed.add_field(name="Removed By", value=interaction.user.mention, inline=True)
+        await _post_admin_log(self.bot, embed)
+
+        embed2, view = build_admins_embed_view(self.guild, self.bot)
         view._message = self._message
-        await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.response.edit_message(embed=embed2, view=view)
 
 
-def build_admins_embed_view(guild: discord.Guild) -> tuple:
+def build_admins_embed_view(guild: discord.Guild, bot: commands.Bot) -> tuple:
     rows = get_admins()
     embed = base_embed("🔐 Bot Admins", "Admins can configure the bot and manage activities.")
     if not rows:
@@ -136,7 +174,7 @@ def build_admins_embed_view(guild: discord.Guild) -> tuple:
             name = m.display_name if m else f"Unknown ({r['user_id']})"
             lines.append(f"• **{name}** (`{r['user_id']}`)")
         embed.add_field(name=f"Current Admins ({len(rows)})", value="\n".join(lines), inline=False)
-    view = AdminsView(guild)
+    view = AdminsView(guild, bot)
     return embed, view
 
 
@@ -168,9 +206,10 @@ def build_settings_embed() -> discord.Embed:
 
 
 class SettingsView(DisableOnTimeout):
-    def __init__(self, guild: discord.Guild):
+    def __init__(self, guild: discord.Guild, bot: commands.Bot):
         super().__init__(timeout=300)
         self.guild = guild
+        self.bot = bot
         self._message: Optional[discord.Message] = None
         self._refresh_toggle_styles()
 
@@ -183,47 +222,51 @@ class SettingsView(DisableOnTimeout):
         cls=discord.ui.ChannelSelect,
         placeholder="📺 Set Fitness Channel...",
         channel_types=[discord.ChannelType.text],
-        min_values=1,
-        max_values=1,
-        row=0,
+        min_values=1, max_values=1, row=0,
     )
-    async def fitness_channel_select(
-        self, interaction: discord.Interaction, select: discord.ui.ChannelSelect
-    ):
+    async def fitness_channel_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
         ch = select.values[0]
         set_setting("fitness_channel_id", str(ch.id))
+
+        embed = discord.Embed(title="⚙️ Setting Changed", colour=COLOUR_PRIMARY)
+        embed.add_field(name="Fitness Channel", value=f"<#{ch.id}>", inline=True)
+        embed.add_field(name="Changed By", value=interaction.user.mention, inline=True)
+        await _post_admin_log(self.bot, embed)
+
         await interaction.response.edit_message(embed=build_settings_embed(), view=self)
 
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
         placeholder="🔔 Set Admin Channel...",
         channel_types=[discord.ChannelType.text],
-        min_values=1,
-        max_values=1,
-        row=1,
+        min_values=1, max_values=1, row=1,
     )
-    async def admin_channel_select(
-        self, interaction: discord.Interaction, select: discord.ui.ChannelSelect
-    ):
+    async def admin_channel_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
         ch = select.values[0]
         set_setting("admin_channel_id", str(ch.id))
+
+        embed = discord.Embed(title="⚙️ Setting Changed", colour=COLOUR_PRIMARY)
+        embed.add_field(name="Admin Channel", value=f"<#{ch.id}>", inline=True)
+        embed.add_field(name="Changed By", value=interaction.user.mention, inline=True)
+        await _post_admin_log(self.bot, embed)
+
         await interaction.response.edit_message(embed=build_settings_embed(), view=self)
 
     @discord.ui.button(label="🎯 Goal (days/wk)", style=discord.ButtonStyle.secondary, row=2)
     async def set_goal(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(
-            NumericSettingModal("goal_days_per_week", "Goal (days/week)", "e.g. 4", self._message)
+            NumericSettingModal("goal_days_per_week", "Goal (days/week)", "e.g. 4", self._message, self.bot)
         )
 
     @discord.ui.button(label="🏆 Elite Goal", style=discord.ButtonStyle.secondary, row=2)
     async def set_elite(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(
-            NumericSettingModal("elite_days_per_week", "Elite Goal (days/week)", "e.g. 5.5", self._message)
+            NumericSettingModal("elite_days_per_week", "Elite Goal (days/week)", "e.g. 5.5", self._message, self.bot)
         )
 
     @discord.ui.button(label="🕐 Grace Days (0-7)", style=discord.ButtonStyle.secondary, row=2)
     async def set_grace(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(GraceDaysModal(self._message))
+        await interaction.response.send_modal(GraceDaysModal(self._message, self.bot))
 
     @discord.ui.button(label="✅ Manual Verify: OFF", style=discord.ButtonStyle.green, row=3)
     async def toggle_verification(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -231,33 +274,40 @@ class SettingsView(DisableOnTimeout):
         new = "0" if cur == "1" else "1"
         set_setting("manual_verification", new)
         self._refresh_toggle_styles()
+
+        embed = discord.Embed(title="⚙️ Setting Changed", colour=COLOUR_PRIMARY)
+        embed.add_field(name="Manual Verification", value="✅ ON" if new == "1" else "🟡 OFF (auto)", inline=True)
+        embed.add_field(name="Changed By", value=interaction.user.mention, inline=True)
+        await _post_admin_log(self.bot, embed)
+
         await interaction.response.edit_message(embed=build_settings_embed(), view=self)
 
     @discord.ui.button(label="📅 Challenge Dates", style=discord.ButtonStyle.secondary, row=3)
     async def set_dates(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ChallengeDatesModal(self._message))
+        await interaction.response.send_modal(ChallengeDatesModal(self._message, self.bot))
 
     @discord.ui.button(label="🌎 Timezone", style=discord.ButtonStyle.secondary, row=4)
     async def set_tz(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(
-            TextSettingModal("timezone", "Timezone", "e.g. US/Eastern", self._message)
+            TextSettingModal("timezone", "Timezone", "e.g. US/Eastern", self._message, self.bot)
         )
 
     @discord.ui.button(label="🏅 Elite Reward", style=discord.ButtonStyle.secondary, row=4)
     async def set_elite_reward(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(
-            TextSettingModal("elite_reward_text", "Elite Reward Description", "Describe the reward...", self._message)
+            TextSettingModal("elite_reward_text", "Elite Reward Description", "Describe the reward...", self._message, self.bot)
         )
 
 
 class NumericSettingModal(discord.ui.Modal):
     value_input = discord.ui.TextInput(label="Value", required=True, max_length=10)
 
-    def __init__(self, setting_key: str, title: str, placeholder: str, message):
+    def __init__(self, setting_key: str, title: str, placeholder: str, message, bot: commands.Bot):
         super().__init__(title=title[:45])
         self.setting_key = setting_key
         self.value_input.placeholder = placeholder
         self._message = message
+        self.bot = bot
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = self.value_input.value.strip()
@@ -269,6 +319,12 @@ class NumericSettingModal(discord.ui.Modal):
             )
             return
         set_setting(self.setting_key, raw)
+
+        embed = discord.Embed(title="⚙️ Setting Changed", colour=COLOUR_PRIMARY)
+        embed.add_field(name=self.setting_key, value=raw, inline=True)
+        embed.add_field(name="Changed By", value=interaction.user.mention, inline=True)
+        await _post_admin_log(self.bot, embed)
+
         await interaction.response.edit_message(embed=build_settings_embed())
 
 
@@ -276,13 +332,13 @@ class GraceDaysModal(discord.ui.Modal, title="Set Grace Days (0-7)"):
     value_input = discord.ui.TextInput(
         label="Grace Days",
         placeholder="0 = off, 1-7 = gap days allowed without breaking streak",
-        required=True,
-        max_length=1,
+        required=True, max_length=1,
     )
 
-    def __init__(self, message):
+    def __init__(self, message, bot: commands.Bot):
         super().__init__()
         self._message = message
+        self.bot = bot
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = self.value_input.value.strip()
@@ -297,20 +353,33 @@ class GraceDaysModal(discord.ui.Modal, title="Set Grace Days (0-7)"):
             )
             return
         set_setting("grace_days", str(val))
+
+        embed = discord.Embed(title="⚙️ Setting Changed", colour=COLOUR_PRIMARY)
+        embed.add_field(name="Grace Days", value=str(val), inline=True)
+        embed.add_field(name="Changed By", value=interaction.user.mention, inline=True)
+        await _post_admin_log(self.bot, embed)
+
         await interaction.response.edit_message(embed=build_settings_embed())
 
 
 class TextSettingModal(discord.ui.Modal):
     value_input = discord.ui.TextInput(label="Value", required=True, max_length=200)
 
-    def __init__(self, setting_key: str, title: str, placeholder: str, message):
+    def __init__(self, setting_key: str, title: str, placeholder: str, message, bot: commands.Bot):
         super().__init__(title=title[:45])
         self.setting_key = setting_key
         self.value_input.placeholder = placeholder
         self._message = message
+        self.bot = bot
 
     async def on_submit(self, interaction: discord.Interaction):
         set_setting(self.setting_key, self.value_input.value.strip())
+
+        embed = discord.Embed(title="⚙️ Setting Changed", colour=COLOUR_PRIMARY)
+        embed.add_field(name=self.setting_key, value=self.value_input.value.strip()[:200], inline=True)
+        embed.add_field(name="Changed By", value=interaction.user.mention, inline=True)
+        await _post_admin_log(self.bot, embed)
+
         await interaction.response.edit_message(embed=build_settings_embed())
 
 
@@ -318,9 +387,10 @@ class ChallengeDatesModal(discord.ui.Modal, title="Set Challenge Dates"):
     start = discord.ui.TextInput(label="Start Date (YYYY-MM-DD)", placeholder="2025-01-06", required=True)
     end   = discord.ui.TextInput(label="End Date (YYYY-MM-DD)", placeholder="2025-03-30", required=True)
 
-    def __init__(self, message):
+    def __init__(self, message, bot: commands.Bot):
         super().__init__()
         self._message = message
+        self.bot = bot
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -333,6 +403,13 @@ class ChallengeDatesModal(discord.ui.Modal, title="Set Challenge Dates"):
             return
         set_setting("challenge_start", self.start.value.strip())
         set_setting("challenge_end", self.end.value.strip())
+
+        embed = discord.Embed(title="⚙️ Challenge Dates Updated", colour=COLOUR_PRIMARY)
+        embed.add_field(name="Start", value=self.start.value.strip(), inline=True)
+        embed.add_field(name="End", value=self.end.value.strip(), inline=True)
+        embed.add_field(name="Changed By", value=interaction.user.mention, inline=False)
+        await _post_admin_log(self.bot, embed)
+
         await interaction.response.edit_message(embed=build_settings_embed())
 
 
@@ -356,58 +433,65 @@ def build_members_embed(guild: discord.Guild) -> discord.Embed:
 
 
 class MembersView(DisableOnTimeout):
-    def __init__(self, guild: discord.Guild):
+    def __init__(self, guild: discord.Guild, bot: commands.Bot):
         super().__init__(timeout=180)
         self.guild = guild
+        self.bot = bot
         self._message: Optional[discord.Message] = None
 
     @discord.ui.select(
         cls=discord.ui.UserSelect,
         placeholder="➕ Add member to challenge...",
-        min_values=1,
-        max_values=1,
-        row=0,
+        min_values=1, max_values=1, row=0,
     )
-    async def add_member_select(
-        self, interaction: discord.Interaction, select: discord.ui.UserSelect
-    ):
+    async def add_member_select(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
         member = select.values[0]
         upsert_member(member.id, member.display_name)
         set_member_active(member.id, True)
-        view = MembersView(self.guild)
+
+        embed = discord.Embed(title="👥 Member Added", colour=COLOUR_PRIMARY)
+        embed.add_field(name="Member", value=f"{member.mention} ({member.display_name})", inline=True)
+        embed.add_field(name="Added By", value=interaction.user.mention, inline=True)
+        await _post_admin_log(self.bot, embed)
+
+        view = MembersView(self.guild, self.bot)
         view._message = self._message
         await interaction.response.edit_message(embed=build_members_embed(self.guild), view=view)
 
     @discord.ui.select(
         cls=discord.ui.UserSelect,
         placeholder="🚫 Make member inactive...",
-        min_values=1,
-        max_values=1,
-        row=1,
+        min_values=1, max_values=1, row=1,
     )
-    async def deactivate_member_select(
-        self, interaction: discord.Interaction, select: discord.ui.UserSelect
-    ):
+    async def deactivate_member_select(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
         member = select.values[0]
         set_member_active(member.id, False)
-        view = MembersView(self.guild)
+
+        embed = discord.Embed(title="🚫 Member Deactivated", colour=COLOUR_WARNING)
+        embed.add_field(name="Member", value=f"{member.mention} ({member.display_name})", inline=True)
+        embed.add_field(name="By", value=interaction.user.mention, inline=True)
+        await _post_admin_log(self.bot, embed)
+
+        view = MembersView(self.guild, self.bot)
         view._message = self._message
         await interaction.response.edit_message(embed=build_members_embed(self.guild), view=view)
 
     @discord.ui.select(
         cls=discord.ui.UserSelect,
         placeholder="✅ Reactivate member...",
-        min_values=1,
-        max_values=1,
-        row=2,
+        min_values=1, max_values=1, row=2,
     )
-    async def reactivate_member_select(
-        self, interaction: discord.Interaction, select: discord.ui.UserSelect
-    ):
+    async def reactivate_member_select(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
         member = select.values[0]
         upsert_member(member.id, member.display_name)
         set_member_active(member.id, True)
-        view = MembersView(self.guild)
+
+        embed = discord.Embed(title="✅ Member Reactivated", colour=COLOUR_PRIMARY)
+        embed.add_field(name="Member", value=f"{member.mention} ({member.display_name})", inline=True)
+        embed.add_field(name="By", value=interaction.user.mention, inline=True)
+        await _post_admin_log(self.bot, embed)
+
+        view = MembersView(self.guild, self.bot)
         view._message = self._message
         await interaction.response.edit_message(embed=build_members_embed(self.guild), view=view)
 
@@ -422,7 +506,7 @@ class AdminCog(commands.Cog):
     @is_bot_admin()
     async def admins_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        embed, view = build_admins_embed_view(interaction.guild)
+        embed, view = build_admins_embed_view(interaction.guild, self.bot)
         msg = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
         view._message = msg
 
@@ -431,7 +515,7 @@ class AdminCog(commands.Cog):
     async def settings_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         embed = build_settings_embed()
-        view = SettingsView(interaction.guild)
+        view = SettingsView(interaction.guild, self.bot)
         msg = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
         view._message = msg
 
@@ -440,9 +524,94 @@ class AdminCog(commands.Cog):
     async def members_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         embed = build_members_embed(interaction.guild)
-        view = MembersView(interaction.guild)
+        view = MembersView(interaction.guild, self.bot)
         msg = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
         view._message = msg
+
+    # ── /streaks ──────────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="streaks",
+        description="[Admin] View best streaks and total active days for all members.",
+    )
+    @is_bot_admin()
+    async def streaks_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        from bot.utils.streak_utils import compute_daily_streak, compute_weekly_streak
+
+        with get_conn() as conn:
+            active_rows = conn.execute(
+                "SELECT * FROM members WHERE is_active=1 ORDER BY username"
+            ).fetchall()
+            inactive_rows = conn.execute(
+                "SELECT * FROM members WHERE is_active=0 ORDER BY username"
+            ).fetchall()
+
+        def _member_stats(rows):
+            results = []
+            for r in rows:
+                uid = r["user_id"]
+                total = get_total_activity_count(uid)
+                _, best_daily = compute_daily_streak(uid)
+                _, best_weekly = compute_weekly_streak(uid)
+                results.append({
+                    "username": r["username"],
+                    "user_id": uid,
+                    "total": total,
+                    "best_daily": best_daily,
+                    "best_weekly": best_weekly,
+                })
+            results.sort(key=lambda x: x["total"], reverse=True)
+            return results
+
+        active_stats = _member_stats(active_rows)
+        inactive_stats = _member_stats(inactive_rows)
+
+        combined_total = sum(s["total"] for s in active_stats)
+
+        embed = discord.Embed(title="🏆 Member Streaks & Activity", colour=0x5865F2)
+
+        if active_stats:
+            lines = []
+            for s in active_stats:
+                lines.append(
+                    f"**{s['username']}** — "
+                    f"{s['total']} days total  |  "
+                    f"🔥 Best daily: {s['best_daily']}  |  "
+                    f"📅 Best weekly: {s['best_weekly']} wks"
+                )
+            embed.add_field(
+                name=f"Active Members ({len(active_stats)})",
+                value="\n".join(lines),
+                inline=False,
+            )
+        else:
+            embed.add_field(name="Active Members", value="None.", inline=False)
+
+        embed.add_field(
+            name="📊 Combined Active Days",
+            value=f"**{combined_total}** total days logged by all active members",
+            inline=False,
+        )
+
+        if inactive_stats:
+            lines = []
+            for s in inactive_stats:
+                lines.append(
+                    f"~~{s['username']}~~ — "
+                    f"{s['total']} days  |  "
+                    f"🔥 {s['best_daily']}  |  "
+                    f"📅 {s['best_weekly']} wks"
+                )
+            embed.add_field(
+                name=f"Inactive Members ({len(inactive_stats)})",
+                value="\n".join(lines),
+                inline=False,
+            )
+
+        embed.set_footer(text="Sorted by total active days. Best streaks are all-time highs.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.CheckFailure):
@@ -456,6 +625,7 @@ class AdminCog(commands.Cog):
                 )
         else:
             logger.exception("Admin cog error: %s", error)
+            await _post_admin_error(self.bot, "Admin Cog Error", str(error))
 
 
 async def setup(bot: commands.Bot):

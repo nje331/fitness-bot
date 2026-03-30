@@ -4,7 +4,8 @@ activity_cog.py — Core activity tracking.
 Handles:
 - on_message listener for workout photos in the fitness channel
 - on_raw_reaction_add for admin ✅ verification
-- /add and /remove activity admin commands
+- /addactivity and /removeactivity admin commands
+- Admin channel logging for all meaningful events
 """
 
 import logging
@@ -16,13 +17,32 @@ from discord.ext import commands
 
 from bot.database import (
     get_setting, log_activity, remove_activity, upsert_member,
-    get_member, verify_activity, get_conn,
+    get_member, verify_activity, get_conn, set_member_active,
 )
 from bot.utils.checks import is_bot_admin
-from bot.utils.embed_utils import success_embed, error_embed, warning_embed
+from bot.utils.embed_utils import success_embed, error_embed, warning_embed, COLOUR_PRIMARY, COLOUR_WARNING
 from bot.utils.time_utils import today_local
 
 logger = logging.getLogger(__name__)
+
+
+async def _admin_log(bot: commands.Bot, embed: discord.Embed) -> None:
+    """Post an embed to the admin channel."""
+    try:
+        cid = get_setting("admin_channel_id")
+        if not cid:
+            return
+        ch = bot.get_channel(int(cid))
+        if isinstance(ch, discord.TextChannel):
+            await ch.send(embed=embed)
+    except Exception as e:
+        logger.warning("Failed to post admin log: %s", e)
+
+
+async def _admin_error(bot: commands.Bot, title: str, description: str) -> None:
+    embed = error_embed(title, description)
+    await _admin_log(bot, embed)
+    logger.error("Admin error — %s: %s", title, description)
 
 
 class ActivityCog(commands.Cog):
@@ -44,7 +64,6 @@ class ActivityCog(commands.Cog):
         if message.channel.id != int(fitness_channel_id):
             return
 
-        # Must have at least one image or video attachment (GIFs excluded)
         def _is_valid(a: discord.Attachment) -> bool:
             ct = a.content_type or ""
             if ct.startswith("image/gif"):
@@ -63,13 +82,21 @@ class ActivityCog(commands.Cog):
         upsert_member(user.id, user.display_name)
 
         member_row = get_member(user.id)
-        if member_row and not member_row["is_active"]:
-            return  # Inactive members don't earn credit
+        was_inactive = member_row and not member_row["is_active"]
+
+        if was_inactive:
+            # Reactivate member automatically when they post a photo
+            set_member_active(user.id, True)
+            reactivate_embed = discord.Embed(title="✅ Member Reactivated", colour=COLOUR_PRIMARY)
+            reactivate_embed.add_field(name="Member", value=f"{user.mention} ({user.display_name})", inline=True)
+            reactivate_embed.add_field(name="Reason", value="Posted a photo while inactive", inline=True)
+            reactivate_embed.set_footer(text=f"Message: {message.jump_url}")
+            await _admin_log(self.bot, reactivate_embed)
 
         activity_date = today_local()
         manual_verification = get_setting("manual_verification") == "1"
-
         verified_flag = 0 if manual_verification else 1
+
         inserted = log_activity(
             user_id=user.id,
             activity_date=activity_date,
@@ -85,7 +112,6 @@ class ActivityCog(commands.Cog):
                 try:
                     emoji_id = int(pog_emoji_str.split(":")[-1].rstrip(">"))
                     emoji = discord.utils.get(message.guild.emojis, id=emoji_id)
-                    # logger.debug(str(emoji_id) + ' ' + emoji)
                     if emoji:
                         await message.add_reaction(emoji)
                     else:
@@ -101,12 +127,10 @@ class ActivityCog(commands.Cog):
                     user.id, activity_date, message.id,
                 )
             else:
-                logger.info(
-                    "Activity logged — user=%s date=%s", user.id, activity_date
-                )
+                logger.info("Activity logged — user=%s date=%s", user.id, activity_date)
         else:
             logger.debug(
-                "Duplicate activity post ignored — user=%s already has credit for %s (no reaction added)",
+                "Duplicate activity post ignored — user=%s already has credit for %s",
                 user.id, activity_date,
             )
 
@@ -119,7 +143,6 @@ class ActivityCog(commands.Cog):
         if payload.member and payload.member.bot:
             return
 
-        # Only admins' reactions count
         from bot.database import is_admin
         if not is_admin(payload.user_id):
             guild = self.bot.get_guild(payload.guild_id)
@@ -128,14 +151,13 @@ class ActivityCog(commands.Cog):
                 if not (member and member.guild_permissions.administrator):
                     return
 
-        # Verify based on the original message's post date (not today)
         with get_conn() as conn:
             row = conn.execute(
                 "SELECT * FROM activity_logs WHERE message_id=? AND verified=0",
                 (payload.message_id,),
             ).fetchone()
         if row is None:
-            return  # Already verified or not tracked
+            return
 
         verified = verify_activity(payload.message_id)
         if verified:
@@ -143,6 +165,19 @@ class ActivityCog(commands.Cog):
                 "Activity manually verified — message=%s by admin=%s",
                 payload.message_id, payload.user_id,
             )
+
+            # Look up the member name for the log
+            guild = self.bot.get_guild(payload.guild_id)
+            subject_member = guild.get_member(row["user_id"]) if guild else None
+            subject_name = subject_member.display_name if subject_member else f"User {row['user_id']}"
+            admin_member = guild.get_member(payload.user_id) if guild else None
+            admin_name = admin_member.display_name if admin_member else f"User {payload.user_id}"
+
+            embed = discord.Embed(title="✅ Activity Verified", colour=0x57F287)
+            embed.add_field(name="Member", value=subject_name, inline=True)
+            embed.add_field(name="Date", value=row["activity_date"], inline=True)
+            embed.add_field(name="Verified By", value=admin_name, inline=True)
+            await _admin_log(self.bot, embed)
 
     # ── /addactivity admin command ────────────────────────────────────────────
 
@@ -176,7 +211,7 @@ class ActivityCog(commands.Cog):
         inserted = log_activity(
             user_id=member.id,
             activity_date=d,
-            verified=2,  # 2 = manually added by admin
+            verified=2,
             added_by=interaction.user.id,
         )
         if inserted:
@@ -187,6 +222,11 @@ class ActivityCog(commands.Cog):
                 ),
                 ephemeral=True,
             )
+            log_embed = discord.Embed(title="➕ Activity Manually Added", colour=0x57F287)
+            log_embed.add_field(name="Member", value=f"{member.mention} ({member.display_name})", inline=True)
+            log_embed.add_field(name="Date", value=d.isoformat(), inline=True)
+            log_embed.add_field(name="Added By", value=interaction.user.mention, inline=True)
+            await _admin_log(self.bot, log_embed)
         else:
             await interaction.response.send_message(
                 embed=warning_embed(
@@ -230,6 +270,11 @@ class ActivityCog(commands.Cog):
                 ),
                 ephemeral=True,
             )
+            log_embed = discord.Embed(title="➖ Activity Removed", colour=COLOUR_WARNING)
+            log_embed.add_field(name="Member", value=f"{member.mention} ({member.display_name})", inline=True)
+            log_embed.add_field(name="Date", value=d.isoformat(), inline=True)
+            log_embed.add_field(name="Removed By", value=interaction.user.mention, inline=True)
+            await _admin_log(self.bot, log_embed)
         else:
             await interaction.response.send_message(
                 embed=error_embed(
@@ -247,6 +292,7 @@ class ActivityCog(commands.Cog):
             )
         else:
             logger.exception("ActivityCog error: %s", error)
+            await _admin_error(self.bot, "ActivityCog Error", str(error))
 
 
 async def setup(bot: commands.Bot):
