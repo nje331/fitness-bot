@@ -15,6 +15,7 @@ Hourly safety check:
 import logging
 from datetime import date, timedelta, datetime, timezone, time as dtime
 from typing import Optional
+from zoneinfo import ZoneInfo
 import asyncio
 
 import discord
@@ -124,12 +125,10 @@ class SchedulerCog(commands.Cog):
         if last_sent == today.isoformat():
             return  # Already sent today
 
-        # Only fire the safety net at 8 AM or later — don't race the scheduled task
-        # or send in the middle of the night.
-        now_utc = datetime.now()
-        now_et = et_time(now_utc.hour, now_utc.minute)
-        if now_et.hour < 8:
-            logger.debug("Hourly check: before 8 AM ET, standing by.")
+        # Only trigger the safety send if the current local time is strictly after 8:00 AM ET.
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        if (now_et.hour < 8) or (now_et.hour == 8 and now_et.minute == 0):
+            logger.debug("Hourly check: before or exactly at 8:00 AM ET, standing by.")
             return
 
         logger.warning("Hourly check: Monday send not recorded — triggering safety send now.")
